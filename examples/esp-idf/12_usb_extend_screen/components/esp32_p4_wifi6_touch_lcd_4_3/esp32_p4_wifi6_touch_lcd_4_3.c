@@ -157,11 +157,23 @@ esp_err_t bsp_sdcard_mount(void)
         .format_if_mount_failed = false,
 #endif
         .max_files = 5,
-        .allocation_unit_size = 64 * 1024};
+        .allocation_unit_size = 64 * 1024
+    };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+
+    sd_pwr_ctrl_ldo_config_t ldo_config = {
+        .ldo_chan_id = 4,
+    };
+    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
+    esp_err_t ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create a new on-chip LDO power control driver");
+        return ret;
+    }
+    host.pwr_ctrl_handle = pwr_ctrl_handle;
 
     const sdmmc_slot_config_t slot_config = {
         /* SD card is connected to Slot 0 pins. Slot 0 uses IO MUX, so not specifying the pins here */
