@@ -7,11 +7,10 @@
 #include "ui/SettingsUI.hpp"
 #include "lvgl.h"
 #include "esp_brookesia.hpp"
-#include "esp_event.h"
-#include "esp_netif.h"
 #include "esp_sntp.h"
-#include "esp_wifi.h"
+#include <atomic>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 #include <time.h>
 #ifdef ESP_UTILS_LOG_TAG
@@ -33,7 +32,8 @@ LV_IMG_DECLARE(img_app_settings);
 
 namespace esp_brookesia::apps
 {
-    static bool s_time_sync_started = false;
+    // Set from both the app task and the Wi-Fi service publisher task.
+    static std::atomic<bool> s_time_sync_started{false};
     static bool s_time_synced = false;
 
     static void time_sync_notification_cb(struct timeval *tv)
@@ -47,7 +47,7 @@ namespace esp_brookesia::apps
 
     static void start_time_sync_once()
     {
-        if (s_time_sync_started || esp_sntp_enabled()) {
+        if (esp_sntp_enabled() || s_time_sync_started.exchange(true)) {
             return;
         }
 
@@ -57,16 +57,15 @@ namespace esp_brookesia::apps
         esp_sntp_setservername(0, "ntp.aliyun.com");
         esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
         esp_sntp_init();
-        s_time_sync_started = true;
         ESP_UTILS_LOGI("SNTP time sync started");
     }
 
-    static void wifi_time_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+    // Runs in the Wi-Fi service publisher task.
+    static void wifi_time_event_handler(const adf_event_t *event, void *ctx)
     {
-        (void)arg;
-        (void)event_data;
+        (void)ctx;
 
-        if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (event->event_id == BOARD_WIFI_EVENT_STA_GOT_IP) {
             start_time_sync_once();
         }
     }
@@ -97,7 +96,7 @@ namespace esp_brookesia::apps
         destroy_settings_ui();
         lv_obj_clean(lv_scr_act());
 
-        page_root = settings_ui::create_page(lv_scr_act());
+        page_root = settings_ui::create_page(lv_scr_act(), getContentTopInset());
         settings_ui::create_header(page_root, "Settings");
         settings_ui::init_list_styles(style_list, style_list_btn, style_list_text, style_list_btn_pressed);
 
@@ -234,6 +233,20 @@ namespace esp_brookesia::apps
         active_page = ActivePage::None;
     }
 
+    lv_coord_t Settings::getContentTopInset()
+    {
+        // The core only shrinks the app screen for an opaque, fixed status bar. The phone
+        // stylesheets use a transparent one that floats over the app, so reserve its height here.
+        if (getActiveConfig().status_bar_visual_mode != systems::phone::StatusBar::VisualMode::SHOW_FIXED) {
+            return 0;
+        }
+        const auto &status_bar = getSystem()->getDisplay().getData().status_bar.data.main;
+        if (status_bar.background_color.opacity == LV_OPA_COVER) {
+            return 0;
+        }
+        return static_cast<lv_coord_t>(status_bar.size.height);
+    }
+
     void Settings::showRootPage()
     {
         close_active_page();
@@ -305,7 +318,7 @@ namespace esp_brookesia::apps
     bool Settings::init()
     {
         ESP_UTILS_LOGD("Init");
-        initWifi();
+        subscribeWifiEvents();
         return true;
     }
 
@@ -327,68 +340,35 @@ namespace esp_brookesia::apps
         return true;
     }
 
-    esp_err_t Settings::initWifi()
+    esp_err_t Settings::subscribeWifiEvents()
     {
-        static bool netif_initialized = false;
-        static bool event_loop_initialized = false;
-        static bool wifi_initialized = false;
-        static bool time_event_handler_registered = false;
-        static esp_netif_t *sta_netif = nullptr;
-
-        if (!netif_initialized) {
-            esp_err_t ret = esp_netif_init();
-            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-                ESP_UTILS_LOGE("esp_netif_init failed: %s", esp_err_to_name(ret));
-                return ret;
-            }
-            netif_initialized = true;
+        static bool subscribed = false;
+        if (subscribed) {
+            return ESP_OK;
         }
 
-        if (!event_loop_initialized) {
-            esp_err_t ret = esp_event_loop_create_default();
-            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-                ESP_UTILS_LOGE("esp_event_loop_create_default failed: %s", esp_err_to_name(ret));
-                return ret;
-            }
-            event_loop_initialized = true;
-        }
-
-        if (!sta_netif) {
-            sta_netif = esp_netif_create_default_wifi_sta();
-            if (!sta_netif) {
-                ESP_UTILS_LOGE("esp_netif_create_default_wifi_sta failed");
-                return ESP_FAIL;
-            }
-        }
-
-        if (!wifi_initialized) {
-            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-            esp_err_t ret = esp_wifi_init(&cfg);
-            if (ret != ESP_OK) {
-                ESP_UTILS_LOGE("esp_wifi_init failed: %s", esp_err_to_name(ret));
-                return ret;
-            }
-            wifi_initialized = true;
-        }
-
-        if (!time_event_handler_registered) {
-            esp_err_t ret = esp_event_handler_register(
-                IP_EVENT,
-                IP_EVENT_STA_GOT_IP,
-                &wifi_time_event_handler,
-                nullptr);
-            if (ret != ESP_OK) {
-                ESP_UTILS_LOGE("Register time sync event handler failed: %s", esp_err_to_name(ret));
-                return ret;
-            }
-            time_event_handler_registered = true;
-        }
-
-        esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_err_t ret = board_wifi_service_subscribe(
+            BOARD_WIFI_EVENT_STA_GOT_IP, wifi_time_event_handler, nullptr);
         if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("esp_wifi_set_mode returned: %s", esp_err_to_name(ret));
+            ESP_UTILS_LOGE("Subscribe Wi-Fi service events failed: %s", esp_err_to_name(ret));
+            return ret;
         }
+        subscribed = true;
 
+        // Covers Settings being subscribed after the station already obtained an address.
+        if (board_wifi_service_is_connected()) {
+            start_time_sync_once();
+        }
         return ESP_OK;
     }
+
+    // The app is a singleton owned by itself; the registry must not delete it.
+    // Keep the status bar visible: the core then shrinks the app screen below it.
+    ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, Settings, "Settings", []()
+    {
+        return std::shared_ptr<Settings>(
+                   Settings::requestInstance(/* use_status_bar */ true, /* use_navigation_bar */ false),
+                   [](Settings *) {});
+    })
+
 } // namespace esp_brookesia::apps

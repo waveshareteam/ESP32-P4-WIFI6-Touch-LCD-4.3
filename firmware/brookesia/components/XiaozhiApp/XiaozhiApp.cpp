@@ -18,12 +18,14 @@
 #include <utility>
 #include <vector>
 
-#include "bsp_board_extra.h"
+#include "board.h"
 #include "decoder/impl/esp_opus_dec.h"
 #include "encoder/impl/esp_opus_enc.h"
 #include "esp_heap_caps.h"
 #include "esp_netif.h"
 #include "esp_netif_ip_addr.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "esp_xiaozhi_info.h"
 #include "freertos/idf_additions.h"
 #include "sdkconfig.h"
@@ -44,9 +46,15 @@ constexpr uint32_t TRANSPORT_RECONNECT_FALLBACK_MS = 10000;
 constexpr uint32_t ACTIVATION_RETRY_INTERVAL_MS = 3000;
 constexpr uint32_t ACTIVATION_RETRY_MAX_MS = 10000;
 constexpr uint32_t CHAT_SAMPLE_RATE = 16000;
-constexpr uint32_t DEVICE_AUDIO_SAMPLE_RATE = 24000;
+constexpr uint32_t DEVICE_AUDIO_SAMPLE_RATE = CODEC_VOICE_SAMPLE_RATE;
 constexpr uint32_t CHAT_FRAME_DURATION_MS = 60;
 constexpr uint32_t PLAYBACK_DRAIN_MS = 200;
+constexpr uint32_t PLAYBACK_GAP_MAX_MS = 500;
+// The I2S DMA only holds 60 ms, so TTS packets that arrive late over Wi-Fi/TCP cut the speech.
+// Hold playback until this many packets (60 ms each) are queued, at the start of a turn and
+// after the queue runs dry, so the queue absorbs arrival jitter of up to ~240 ms.
+constexpr UBaseType_t PLAYBACK_PREBUFFER_PACKETS = 4;
+constexpr uint32_t PLAYBACK_PREBUFFER_MAX_MS = 400;
 constexpr uint32_t PREROLL_QUEUE_TIMEOUT_MS = 5000;
 constexpr uint32_t PREROLL_ENCODE_TIMEOUT_MS = 15000;
 constexpr uint32_t UPLINK_FIRST_PACKET_TIMEOUT_MS = 3000;
@@ -55,14 +63,26 @@ constexpr uint32_t LIFECYCLE_WAIT_MS = 10000;
 constexpr uint32_t PLAYBACK_IDLE_WAIT_MS = 1000;
 constexpr size_t CONTROL_QUEUE_LENGTH = 24;
 constexpr size_t PCM_QUEUE_LENGTH = 40;
-constexpr size_t PLAYBACK_QUEUE_LENGTH = 10;
-constexpr size_t DEVICE_TDM_CHANNELS = CODEC_VOICE_INPUT_CHANNELS;
-constexpr size_t DEVICE_MIC1_SLOT = 0;
-constexpr size_t DEVICE_ECHO_SLOT = 1;
-constexpr size_t DEVICE_MIC2_SLOT = 2;
+// The server sends TTS in bursts, ahead of real time, and packets arrive before the
+// TtsStart event switches playback on. 40 x 60 ms frames hold 2.4 s, kept in PSRAM.
+constexpr size_t PLAYBACK_QUEUE_LENGTH = 40;
+constexpr size_t DEVICE_INPUT_CHANNELS = CODEC_VOICE_INPUT_CHANNELS;
+// AFE channel i is taken from capture slot AFE_INPUT_SLOTS[i], matching the
+// processor's "MMR" format: MIC1, MIC2, then the MIC3 echo reference.
+constexpr size_t AFE_INPUT_SLOTS[] = {
+    BOARD_MIC1_CHANNEL_INDEX,
+    BOARD_MIC2_CHANNEL_INDEX,
+    BOARD_ECHO_REF_CHANNEL_INDEX,
+};
 static_assert(
-    XiaozhiAudioProcessor::INPUT_CHANNELS == 3,
-    "Xiaozhi AFE input must be MIC1, MIC2, echo reference"
+    sizeof(AFE_INPUT_SLOTS) / sizeof(AFE_INPUT_SLOTS[0]) == XiaozhiAudioProcessor::INPUT_CHANNELS,
+    "Xiaozhi AFE input must be MIC1, MIC2 and the echo reference"
+);
+static_assert(
+    BOARD_MIC1_CHANNEL_INDEX < DEVICE_INPUT_CHANNELS &&
+        BOARD_MIC2_CHANNEL_INDEX < DEVICE_INPUT_CHANNELS &&
+        BOARD_ECHO_REF_CHANNEL_INDEX < DEVICE_INPUT_CHANNELS,
+    "AFE input slot is outside the capture frame"
 );
 constexpr size_t INPUT_READ_FRAMES = DEVICE_AUDIO_SAMPLE_RATE / 100;
 constexpr size_t MAX_SERVER_SAMPLE_RATE = 48000;
@@ -101,6 +121,24 @@ uint32_t activationRetryDelay(int timeout_ms)
         delay = 1000;
     }
     return delay > ACTIVATION_RETRY_MAX_MS ? ACTIVATION_RETRY_MAX_MS : delay;
+}
+
+// The default WIFI_PS_MIN_MODEM lets the C6 radio sleep between DTIM beacons, so TTS
+// packets reach the host in bursts after 100-300 ms stalls and the 60 ms I2S buffer runs
+// dry. Keep the radio awake while a Xiaozhi transport is connected.
+void setWifiLowLatency(bool enable)
+{
+    static bool low_latency = false;
+    if (low_latency == enable) {
+        return;
+    }
+    const esp_err_t ret = esp_wifi_set_ps(enable ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    if (ret != ESP_OK) {
+        ESP_UTILS_LOGW("Set Wi-Fi power save failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    low_latency = enable;
+    ESP_UTILS_LOGI("Wi-Fi power save %s", enable ? "disabled for Xiaozhi" : "restored");
 }
 
 BaseType_t createXiaozhiTask(
@@ -308,6 +346,8 @@ bool XiaozhiApp::close()
     ControlEvent event = {};
     event.type = ControlEventType::AppHidden;
     event.flag = true;
+    // Ask the control task, which owns the protocol, to drop the session too.
+    event.value = 1;
     if (!postControlEvent(event, true)) {
         return false;
     }
@@ -361,7 +401,10 @@ bool XiaozhiApp::init()
                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
                  );
     _playback_queue = _playback_queue ? _playback_queue :
-                      xQueueCreate(PLAYBACK_QUEUE_LENGTH, sizeof(AudioPacket));
+                      xQueueCreateWithCaps(
+                          PLAYBACK_QUEUE_LENGTH, sizeof(AudioPacket),
+                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+                      );
     if (!_state_mutex || !_lifecycle_mutex || !_audio_tx_mutex || !_control_ack ||
             !_control_exited || !_preroll_done || !_control_queue ||
             !_pcm_queue || !_playback_queue) {
@@ -528,7 +571,7 @@ bool XiaozhiApp::deinit()
     _audio_processor = nullptr;
 
     if (_playback_queue) {
-        vQueueDelete(_playback_queue);
+        vQueueDeleteWithCaps(_playback_queue);
         _playback_queue = nullptr;
     }
     if (_pcm_queue) {
@@ -983,15 +1026,28 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
         break;
     case ControlEventType::AppHidden:
         handleAppHidden(event.flag);
+        if (event.value != 0) {
+            // App closed: release the transport; reopening reconnects from
+            // prepareChat() via AppVisible.
+            destroyChat();
+            setState(
+                _network_ready.load() ? State::Preparing : State::NetworkRequired
+            );
+        }
         break;
-    case ControlEventType::NetworkChanged:
-        _network_ready.store(event.flag);
+    case ControlEventType::NetworkChanged: {
+        const bool was_ready = _network_ready.exchange(event.flag);
         if (!event.flag) {
             stopActivationPrompt();
             setState(State::NetworkRequired);
             setAudioModes(false, false);
             closeChannel(false);
             destroyChat();
+        } else if (was_ready) {
+            // Other IP events (e.g. IPv6 addresses) arrive while the network is
+            // already usable; they must not disturb a running turn or wake a
+            // hidden app. Visibility changes are handled by AppVisible.
+            break;
         } else if (!_chat_started.load() && _visible.load()) {
             if (_activation_phase == ActivationPhase::WaitingForBinding ||
                     _activation_phase == ActivationPhase::BoundPendingSuccess) {
@@ -1003,29 +1059,16 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
                 setState(State::Preparing);
             }
             schedulePrepare(0);
-        } else if (_transport_connected) {
-            handleAppVisible();
         }
         break;
+    }
     case ControlEventType::ActionPressed:
         if (_state.load() == State::ActivationRequired) {
             announceActivation(true);
         } else if (_state.load() == State::Ready) {
             startListening(ListenMode::AutoStop);
-        } else if (_state.load() == State::Listening &&
-                   _listen_mode == ListenMode::Manual) {
-            finishListening();
-        } else if ((_state.load() == State::Speaking ||
-                    _state.load() == State::Processing) &&
-                   _listen_mode == ListenMode::Manual) {
-            cancelManualConversation();
-        } else if (_state.load() == State::Listening ||
-                   _state.load() == State::Speaking ||
-                   _state.load() == State::Processing) {
-            closeChannel(true);
-            setState(State::Ready);
-            enterReadyAudioMode();
         }
+        // Taps during a turn are ignored; only the wake word interrupts.
         break;
     case ControlEventType::AnnounceActivation:
         announceActivation(true);
@@ -1070,6 +1113,7 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
     }
     case ControlEventType::TransportConnected:
         _transport_connected = true;
+        setWifiLowLatency(true);
         _server_goodbye_generation.store(0);
         if (_chat_started.load() &&
                 (_state.load() == State::Connecting ||
@@ -1155,9 +1199,10 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
         if (_channel_state.load() == ChannelState::Open &&
                 _listen_mode != ListenMode::None) {
             ESP_UTILS_LOGI(
-                "Server text received (role=%u, bytes=%u)",
+                "Server text received (role=%u, bytes=%u): %s",
                 static_cast<unsigned int>(event.role),
-                static_cast<unsigned int>(strlen(event.text))
+                static_cast<unsigned int>(strlen(event.text)),
+                event.text
             );
             setChatMessage(
                 static_cast<XiaozhiClient::TextRole>(event.role), event.text
@@ -1167,7 +1212,12 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
     case ControlEventType::Emotion:
         if (_channel_state.load() == ChannelState::Open &&
                 _listen_mode != ListenMode::None) {
+            ESP_UTILS_LOGI("Server emotion received: %s", event.text);
             setEmotion(event.text);
+        } else {
+            ESP_UTILS_LOGW(
+                "Server emotion ignored outside a turn: %s", event.text
+            );
         }
         break;
     case ControlEventType::TtsStart: {
@@ -1184,6 +1234,13 @@ void XiaozhiApp::handleControlEvent(const ControlEvent &event)
                 setError(ESP_FAIL, "Enable wake-word interruption");
                 schedulePrepare(RETRY_INTERVAL_MS);
                 break;
+            }
+            if (_audio_processor) {
+                (void)_audio_processor->setWakeWordStrict(true);
+            }
+            if (!_tts_active) {
+                _playback_packets_dropped.store(0);
+                _playback_gaps.store(0);
             }
             _awaiting_response = false;
             _tts_active = true;
@@ -1342,6 +1399,16 @@ bool XiaozhiApp::prepareChat()
     const bool was_waiting =
         _activation_phase == ActivationPhase::WaitingForBinding ||
         _activation_phase == ActivationPhase::BoundPendingSuccess;
+#if CONFIG_XIAOZHI_APP_TRANSPORT_AUTO || CONFIG_XIAOZHI_APP_TRANSPORT_MQTT
+    // esp_xiaozhi sends an empty Client-Id when board/uuid is missing, so a
+    // bound board with erased NVS would get MQTT credentials it cannot use.
+    const esp_err_t identity_ret = _activation_client->ensureIdentity();
+    if (identity_ret != ESP_OK) {
+        setError(identity_ret, "Create Xiaozhi device identity");
+        schedulePrepare(RETRY_INTERVAL_MS);
+        return false;
+    }
+#endif
     ScopedXiaozhiInfo service;
     esp_err_t ret = esp_xiaozhi_chat_get_info(&service.value);
     if (!canPrepare()) {
@@ -1549,6 +1616,7 @@ bool XiaozhiApp::prepareChat()
             frame_duration_ms : CHAT_FRAME_DURATION_MS
         );
         packet.size = static_cast<uint16_t>(len);
+        packet.arrival_us = esp_timer_get_time();
         memcpy(packet.data, data, len);
 
         if (!_playback_mutex ||
@@ -1556,14 +1624,19 @@ bool XiaozhiApp::prepareChat()
                     _playback_mutex,
                     pdMS_TO_TICKS(CONTROL_EVENT_POST_TIMEOUT_MS)
                 ) != pdTRUE) {
+            _playback_packets_dropped.fetch_add(1);
             return;
         }
         if (_accept_playback.load() &&
                 _chat_generation.load() == client_generation &&
                 packet.turn_generation == _turn_generation.load() &&
-                _channel_state.load() == ChannelState::Open &&
-                xQueueSend(_playback_queue, &packet, 0) == pdTRUE) {
-            _last_audio_packet_tick.store(xTaskGetTickCount());
+                _channel_state.load() == ChannelState::Open) {
+            // Never block the transport task; a full queue loses the packet.
+            if (xQueueSend(_playback_queue, &packet, 0) == pdTRUE) {
+                _last_audio_packet_tick.store(xTaskGetTickCount());
+            } else {
+                _playback_packets_dropped.fetch_add(1);
+            }
         }
         xSemaphoreGive(_playback_mutex);
     };
@@ -1643,14 +1716,14 @@ void XiaozhiApp::destroyChat()
     _chat_generation.fetch_add(1);
     _turn_generation.fetch_add(1);
     _transport_connected = false;
+    setWifiLowLatency(false);
     _server_goodbye_generation.store(0);
     resetChannelState();
 }
 
 bool XiaozhiApp::ensureAudioReady()
 {
-    const bool input_resamplers_ready =
-        _input_resamplers[0] && _input_resamplers[1] && _input_resamplers[2];
+    const bool input_resamplers_ready = _input_resamplers[0] != nullptr;
     if (_audio_tasks_running.load() && _input_task_running.load() &&
             _encoder_task_running.load() && _playback_task_running.load() &&
             _audio_processor && _audio_processor->isReady() &&
@@ -1661,13 +1734,7 @@ bool XiaozhiApp::ensureAudioReady()
     stopActivationPrompt();
     shutdownAudio();
 
-    esp_err_t ret = bsp_extra_codec_set_voice_fs(
-        DEVICE_AUDIO_SAMPLE_RATE,
-        16,
-        CODEC_VOICE_INPUT_CHANNELS,
-        BSP_EXTRA_ES7210_TDM_ALL_SLOTS_MASK,
-        BSP_EXTRA_ES7210_PHYSICAL_CONNECTED_MIC_MASK
-    );
+    esp_err_t ret = board_codec_set_voice_fs(DEVICE_AUDIO_SAMPLE_RATE, 16);
     if (ret != ESP_OK) {
         setError(ret, "Configure audio codec");
         return false;
@@ -1939,7 +2006,7 @@ void XiaozhiApp::shutdownAudio()
     if (_pcm_queue) {
         xQueueReset(_pcm_queue);
     }
-    (void)bsp_extra_codec_dev_stop();
+    (void)board_codec_dev_stop();
 }
 
 bool XiaozhiApp::setAudioModes(bool wake_word, bool voice)
@@ -1953,6 +2020,8 @@ bool XiaozhiApp::setAudioModes(bool wake_word, bool voice)
     if (_audio_processor && _audio_processor->isReady()) {
         bool voice_ok = _audio_processor->enableVoiceProcessing(voice);
         bool wake_word_ok = _audio_processor->enableWakeWord(wake_word);
+        // Only TtsStart raises the threshold, after this call, for the playback it starts.
+        (void)_audio_processor->setWakeWordStrict(false);
         success = voice_ok && wake_word_ok;
         if (!success) {
             (void)_audio_processor->enableWakeWord(false);
@@ -2102,7 +2171,7 @@ bool XiaozhiApp::configureDecoder(
         "Xiaozhi output configured: %u Hz, %u ms%s",
         static_cast<unsigned int>(sample_rate),
         static_cast<unsigned int>(frame_duration_ms),
-        sample_rate == DEVICE_AUDIO_SAMPLE_RATE ? "" : ", resampled to 24000 Hz"
+        sample_rate == DEVICE_AUDIO_SAMPLE_RATE ? "" : ", resampled to device rate"
     );
     return true;
 }
@@ -2491,6 +2560,11 @@ void XiaozhiApp::handlePlaybackDrained()
 
     _tts_stop_pending.store(false);
     _drain_event_posted.store(false);
+    ESP_UTILS_LOGI(
+        "Playback drained: %lu packets dropped, %lu output gaps",
+        static_cast<unsigned long>(_playback_packets_dropped.load()),
+        static_cast<unsigned long>(_playback_gaps.load())
+    );
     if (_restart_transport_after_playback.exchange(false)) {
         ESP_UTILS_LOGI(
             "Final playback drained; restarting Xiaozhi transport now"
@@ -2630,9 +2704,13 @@ bool XiaozhiApp::waitForPlaybackIdle(uint32_t timeout_ms) const
 
 void XiaozhiApp::inputAudio()
 {
+    static_assert(
+        AFE_INPUT_CHANNELS == XiaozhiAudioProcessor::INPUT_CHANNELS,
+        "Resampler channel count must match the AFE input format"
+    );
     const size_t input_bytes =
-        INPUT_READ_FRAMES * DEVICE_TDM_CHANNELS * sizeof(int16_t);
-    auto *device_tdm = static_cast<int16_t *>(malloc(input_bytes));
+        INPUT_READ_FRAMES * DEVICE_INPUT_CHANNELS * sizeof(int16_t);
+    auto *device_interleaved = static_cast<int16_t *>(malloc(input_bytes));
     auto *device_planar = static_cast<int16_t *>(
         malloc(INPUT_READ_FRAMES * AFE_INPUT_CHANNELS * sizeof(int16_t))
     );
@@ -2648,11 +2726,10 @@ void XiaozhiApp::inputAudio()
     );
     uint32_t read_failures = 0;
     uint32_t resample_failures = 0;
-    const bool input_resamplers_ready =
-        _input_resamplers[0] && _input_resamplers[1] && _input_resamplers[2];
-    if (!device_tdm || !device_planar || !chat_planar || !afe_interleaved ||
+    const bool input_resamplers_ready = _input_resamplers[0] != nullptr;
+    if (!device_interleaved || !device_planar || !chat_planar || !afe_interleaved ||
             !input_resamplers_ready) {
-        free(device_tdm);
+        free(device_interleaved);
         free(device_planar);
         free(chat_planar);
         free(afe_interleaved);
@@ -2678,40 +2755,35 @@ void XiaozhiApp::inputAudio()
             continue;
         }
         size_t bytes_read = 0;
-        esp_err_t ret = bsp_extra_i2s_read(
-            device_tdm, input_bytes, &bytes_read, 100
+        esp_err_t ret = board_i2s_read(
+            device_interleaved, input_bytes, &bytes_read, 100
         );
         if (ret == ESP_OK && bytes_read > 0 && _audio_processor) {
             read_failures = 0;
             const uint32_t input_frames = static_cast<uint32_t>(
-                bytes_read / (DEVICE_TDM_CHANNELS * sizeof(int16_t))
+                bytes_read / (DEVICE_INPUT_CHANNELS * sizeof(int16_t))
             );
             uint32_t peak = 0;
             uint64_t absolute_sum = 0;
             for (uint32_t frame = 0; frame < input_frames; ++frame) {
-                const int16_t mic1 =
-                    device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_MIC1_SLOT];
-                const int16_t mic2 =
-                    device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_MIC2_SLOT];
-                const int16_t echo =
-                    device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_ECHO_SLOT];
-                device_planar[frame] = mic1;
-                device_planar[INPUT_READ_FRAMES + frame] = mic2;
-                device_planar[INPUT_READ_FRAMES * 2 + frame] = echo;
-                const int16_t microphone_samples[2] = {mic1, mic2};
-                for (int16_t sample : microphone_samples) {
-                    int32_t value = sample;
-                    uint32_t magnitude = static_cast<uint32_t>(
-                        value < 0 ? -value : value
-                    );
-                    peak = magnitude > peak ? magnitude : peak;
-                    absolute_sum += magnitude;
+                const int16_t *slots =
+                    device_interleaved + frame * DEVICE_INPUT_CHANNELS;
+                for (size_t channel = 0; channel < AFE_INPUT_CHANNELS; ++channel) {
+                    device_planar[channel * INPUT_READ_FRAMES + frame] =
+                        slots[AFE_INPUT_SLOTS[channel]];
                 }
+                // Level statistics track MIC1 only.
+                int32_t value = slots[BOARD_MIC1_CHANNEL_INDEX];
+                uint32_t magnitude = static_cast<uint32_t>(
+                    value < 0 ? -value : value
+                );
+                peak = magnitude > peak ? magnitude : peak;
+                absolute_sum += magnitude;
             }
             _input_pcm_peak.store(peak);
             _input_pcm_mean_abs.store(
                 input_frames ?
-                    static_cast<uint32_t>(absolute_sum / (input_frames * 2)) : 0
+                    static_cast<uint32_t>(absolute_sum / input_frames) : 0
             );
 
             int resample_ret = ESP_AE_ERR_OK;
@@ -2783,7 +2855,7 @@ void XiaozhiApp::inputAudio()
     free(afe_interleaved);
     free(chat_planar);
     free(device_planar);
-    free(device_tdm);
+    free(device_interleaved);
     _input_task_running.store(false);
     vTaskDelete(nullptr);
 }
@@ -2922,6 +2994,17 @@ void XiaozhiApp::playAudio()
     }
 
     uint32_t decode_failures = 0;
+    bool gap_tracking = false;
+    uint32_t gap_turn = 0;
+    uint32_t gap_underruns = 0;
+    // Stage timestamps (us) reported with a gap to show where the playback task lost time.
+    int64_t last_write_end_us = 0;
+    int64_t peek_us = 0;
+    int64_t locked_us = 0;
+    int64_t decoded_us = 0;
+    bool buffering = true;
+    bool rebuffered = false;
+    int64_t buffering_since_us = 0;
     AudioPacket packet = {};
     while (server_pcm && device_pcm && stereo &&
             _audio_tasks_running.load()) {
@@ -2930,9 +3013,28 @@ void XiaozhiApp::playAudio()
             checkPlaybackDrained();
             continue;
         }
+        peek_us = esp_timer_get_time();
         if (_state.load() != State::Speaking) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
+        }
+        if (!gap_tracking || packet.turn_generation != gap_turn) {
+            buffering = true;
+        }
+        if (buffering) {
+            if (buffering_since_us == 0) {
+                buffering_since_us = peek_us;
+            }
+            // TTS stop flushes a short tail; the timeout bounds the wait on a slow link.
+            if (uxQueueMessagesWaiting(_playback_queue) < PLAYBACK_PREBUFFER_PACKETS &&
+                    !_tts_stop_pending.load() &&
+                    peek_us - buffering_since_us <
+                        static_cast<int64_t>(PLAYBACK_PREBUFFER_MAX_MS) * 1000) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            buffering = false;
+            buffering_since_us = 0;
         }
 
         bool received = false;
@@ -2942,6 +3044,7 @@ void XiaozhiApp::playAudio()
         const int16_t *playback_pcm = nullptr;
         if (_playback_mutex &&
                 xSemaphoreTake(_playback_mutex, portMAX_DELAY) == pdTRUE) {
+            locked_us = esp_timer_get_time();
             received =
                 xQueueReceive(_playback_queue, &packet, 0) == pdTRUE;
             if (received) {
@@ -3014,6 +3117,7 @@ void XiaozhiApp::playAudio()
                     }
                 }
             }
+            decoded_us = esp_timer_get_time();
             xSemaphoreGive(_playback_mutex);
         }
         if (!received) {
@@ -3047,12 +3151,51 @@ void XiaozhiApp::playAudio()
                 stereo[i * 2] = playback_pcm[i];
                 stereo[i * 2 + 1] = playback_pcm[i];
             }
+            // An underrun since the previous write of this turn means the speaker went silent
+            // mid-speech. Longer pauses are sentence breaks from the server, not stutter.
+            const uint32_t underruns = board_i2s_get_tx_underrun_count();
+            const TickType_t write_tick = xTaskGetTickCount();
+            if (gap_tracking && packet.turn_generation == gap_turn &&
+                    underruns != gap_underruns &&
+                    write_tick - _last_audio_write_tick.load() <
+                        pdMS_TO_TICKS(PLAYBACK_GAP_MAX_MS)) {
+                const uint32_t gaps = _playback_gaps.fetch_add(1) + 1;
+                const int64_t write_start_us = esp_timer_get_time();
+                // A packet that waited ~0 ms in the queue arrived late (network); one that
+                // waited long sat ready while the playback task was not scheduled.
+                ESP_UTILS_LOGW(
+                    "Playback gap #%lu: %lu ms since last write, %u packets queued, "
+                    "packet waited %ld ms%s "
+                    "(wake %ld ms, lock %ld ms, decode %ld ms, prep %ld ms, core %d)",
+                    static_cast<unsigned long>(gaps),
+                    static_cast<unsigned long>(
+                        pdTICKS_TO_MS(write_tick - _last_audio_write_tick.load())
+                    ),
+                    static_cast<unsigned>(uxQueueMessagesWaiting(_playback_queue)),
+                    static_cast<long>((peek_us - packet.arrival_us) / 1000),
+                    rebuffered ? ", rebuffered" : "",
+                    static_cast<long>((peek_us - last_write_end_us) / 1000),
+                    static_cast<long>((locked_us - peek_us) / 1000),
+                    static_cast<long>((decoded_us - locked_us) / 1000),
+                    static_cast<long>((write_start_us - decoded_us) / 1000),
+                    static_cast<int>(xPortGetCoreID())
+                );
+            }
             size_t written = 0;
             size_t write_size =
                 playback_samples * 2 * sizeof(int16_t);
-            esp_err_t write_ret = bsp_extra_i2s_write(
+            esp_err_t write_ret = board_i2s_write(
                 stereo, write_size, &written, 200
             );
+            last_write_end_us = esp_timer_get_time();
+            rebuffered = false;
+            if (uxQueueMessagesWaiting(_playback_queue) == 0) {
+                buffering = true;
+                rebuffered = true;
+            }
+            gap_tracking = true;
+            gap_turn = packet.turn_generation;
+            gap_underruns = board_i2s_get_tx_underrun_count();
             if (write_ret == ESP_OK && written == write_size) {
                 _last_audio_write_tick.store(xTaskGetTickCount());
             } else {
@@ -3165,5 +3308,11 @@ void XiaozhiApp::uiActionCallback(void *context)
     event.type = ControlEventType::ActionPressed;
     instance->postControlEvent(event);
 }
+
+// The app is a singleton owned by itself; the registry must not delete it.
+ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, XiaozhiApp, "AIChats", []()
+{
+    return std::shared_ptr<XiaozhiApp>(XiaozhiApp::requestInstance(), [](XiaozhiApp *) {});
+})
 
 } // namespace esp_brookesia::apps

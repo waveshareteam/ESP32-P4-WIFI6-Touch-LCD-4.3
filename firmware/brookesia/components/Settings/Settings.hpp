@@ -7,8 +7,8 @@
 
 #include "systems/phone/esp_brookesia_phone_app.hpp"
 #include "lvgl.h"
-#include "bsp/esp-bsp.h"
-#include "bsp_board_extra.h"
+#include "driver/i2c_master.h"
+#include "board.h"
 #include "./ui/AboutPage.hpp"
 #include "./ui/DisplayPage.hpp"
 #include "./ui/SoundPage.hpp"
@@ -28,6 +28,8 @@ namespace esp_brookesia::apps
         ~Settings();
         bool run(void) override;
         void showRootPage();
+        /** Space every Settings page leaves at the top for the floating status bar. */
+        lv_coord_t getContentTopInset();
         i2c_master_bus_handle_t i2c_bus_handle;
         i2c_master_dev_handle_t pmu_dev_handle;
         static int pmu_register_read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len);
@@ -62,7 +64,7 @@ namespace esp_brookesia::apps
         void open_page(const char *page_name);
         void close_active_page();
 
-        esp_err_t initWifi();
+        esp_err_t subscribeWifiEvents();
 
     private:
         static Settings *_instance;

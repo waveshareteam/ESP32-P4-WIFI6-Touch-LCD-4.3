@@ -1,5 +1,5 @@
 version: 0.6.0
 dependencies:
-  esp_video:
-    version: "2.0.1"
+  espressif/esp_video:
+    version: "^2.3.0"
     public: true

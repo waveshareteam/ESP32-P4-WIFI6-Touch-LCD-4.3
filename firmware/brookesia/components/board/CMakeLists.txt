@@ -1,6 +1,11 @@
 set(SRCS "")
 list(APPEND SRCS
-    "src/bsp_board_extra.c"
+    "src/board_camera.c"
+    "src/board_codec.c"
+    "src/board_audio.c"
+    "src/board_display.c"
+    "src/board_storage.c"
+    "src/board_wifi.c"
 )
 
 set(INCLUDE_DIRS "")
@@ -15,8 +20,8 @@ endforeach()
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS ${INCLUDE_DIRS}
-    REQUIRES driver esp_codec_dev esp_driver_gpio esp_driver_i2s
-    PRIV_REQUIRES esp32_p4_wifi6_touch_lcd_4_3 esp_timer fatfs esp_psram esp_mm esp_driver_ledc
+    REQUIRES driver esp_lcd_touch esp_lvgl_adapter esp_board_manager
+    PRIV_REQUIRES esp_timer fatfs esp_psram esp_mm esp_driver_ledc
 )
 
 target_compile_options(

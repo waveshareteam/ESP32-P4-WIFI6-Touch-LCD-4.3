@@ -1,89 +1,35 @@
-idf_component_register(
-    SRCS "main.cpp"
-    INCLUDE_DIRS ".")
-
-target_compile_options(${COMPONENT_LIB} PUBLIC -Wno-missing-field-initializers)
-
-# Function to get component library
-function(get_component_library component_name output_var)
-    # Get the exact component name
-    idf_build_get_property(build_components BUILD_COMPONENTS)
-    set(TARGET_COMPONENT "")
-    foreach(COMPONENT ${build_components})
-        if(COMPONENT MATCHES "${component_name}" OR COMPONENT MATCHES "espressif__${component_name}")
-            set(TARGET_COMPONENT ${COMPONENT})
-            break()
-        endif()
-    endforeach()
-
-    # Get the component library
-    if(TARGET_COMPONENT STREQUAL "")
-        message(FATAL_ERROR "Component '${component_name}' not found.")
-    else()
-        idf_component_get_property(COMPONENT_LIB ${TARGET_COMPONENT} COMPONENT_LIB)
-        set(${output_var} ${COMPONENT_LIB} PARENT_SCOPE)
-    endif()
-endfunction()
-
-# get_component_library("lvgl" LVGL_LIB)
-# target_compile_options(
-#     ${LVGL_LIB}
-#     PUBLIC
-#         "-Wno-attributes"
-# )
-
-set(STORAGE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../spiffs")
-set(STORAGE_STAGING_DIR "${CMAKE_BINARY_DIR}/storage_spiffs")
-set(STORAGE_STAGING_STAMP "${CMAKE_BINARY_DIR}/storage_spiffs.stamp")
-
-file(GLOB_RECURSE STORAGE_SOURCE_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
-    "${STORAGE_SOURCE_DIR}/*")
-file(MAKE_DIRECTORY "${STORAGE_STAGING_DIR}")
-
-# Keep the complete 30 px Chinese font in SPIFFS instead of linking another
-# multi-megabyte LVGL font into the application image. The UI loads it into
-# PSRAM and falls back to the component's static basic font if loading fails.
-idf_build_get_property(build_components BUILD_COMPONENTS)
-set(XIAOZHI_FONTS_DIR "")
-foreach(component IN LISTS build_components)
-    if(component MATCHES "xiaozhi-fonts")
-        idf_component_get_property(XIAOZHI_FONTS_DIR ${component} COMPONENT_DIR)
-        break()
+# Pull in every project component. With MINIMAL_BUILD only components reachable
+# from main are built, so a new app only needs its own directory under
+# components/ plus an ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR registration.
+file(GLOB PROJECT_COMPONENT_DIRS LIST_DIRECTORIES true "${CMAKE_CURRENT_LIST_DIR}/../components/*")
+set(PROJECT_COMPONENTS "")
+foreach(component_dir IN LISTS PROJECT_COMPONENT_DIRS)
+    if(EXISTS "${component_dir}/CMakeLists.txt")
+        get_filename_component(component_name "${component_dir}" NAME)
+        list(APPEND PROJECT_COMPONENTS ${component_name})
     endif()
 endforeach()
 
-if(NOT XIAOZHI_FONTS_DIR)
-    message(FATAL_ERROR "xiaozhi-fonts component was not resolved")
+idf_component_register(
+    SRCS "main.cpp" "BootLoading.cpp"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        ${PROJECT_COMPONENTS}
+        esp_event
+        esp_lvgl_adapter
+        esp_netif
+        esp_wifi
+        nvs_flash
+        board
+)
+
+# Copy the Xiaozhi UI font into the SPIFFS image source directory.
+idf_component_get_property(XIAOZHI_FONTS_DIR 78__xiaozhi-fonts COMPONENT_DIR)
+set(XIAOZHI_FONT_SRC "${XIAOZHI_FONTS_DIR}/cbin/font_puhui_common_30_4.bin")
+if(XIAOZHI_FONTS_DIR AND EXISTS "${XIAOZHI_FONT_SRC}")
+    configure_file("${XIAOZHI_FONT_SRC}" "${CMAKE_CURRENT_LIST_DIR}/../spiffs/xiaozhi/font.bin" COPYONLY)
+else()
+    message(STATUS "xiaozhi-fonts common font not found; skipping SPIFFS font copy")
 endif()
 
-set(XIAOZHI_COMMON_FONT
-    "${XIAOZHI_FONTS_DIR}/cbin/font_puhui_common_30_4.bin")
-if(NOT EXISTS "${XIAOZHI_COMMON_FONT}")
-    message(FATAL_ERROR "xiaozhi-fonts is missing font_puhui_common_30_4.bin")
-endif()
-
-set(XIAOZHI_COMMON_FONT_STAGED
-    "${STORAGE_STAGING_DIR}/xiaozhi/font.bin")
-
-add_custom_command(
-    OUTPUT "${STORAGE_STAGING_STAMP}"
-    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${STORAGE_STAGING_DIR}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${STORAGE_STAGING_DIR}"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${STORAGE_SOURCE_DIR}" "${STORAGE_STAGING_DIR}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${STORAGE_STAGING_DIR}/xiaozhi"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${XIAOZHI_COMMON_FONT}" "${XIAOZHI_COMMON_FONT_STAGED}"
-    COMMAND "${CMAKE_COMMAND}" -E touch "${STORAGE_STAGING_STAMP}"
-    DEPENDS ${STORAGE_SOURCE_FILES} "${XIAOZHI_COMMON_FONT}"
-    COMMENT "Staging SPIFFS resources"
-    VERBATIM
-)
-add_custom_target(storage_spiffs_stage DEPENDS "${STORAGE_STAGING_STAMP}")
-
-spiffs_create_partition_image(
-    storage "${STORAGE_STAGING_DIR}"
-    FLASH_IN_PROJECT
-    DEPENDS storage_spiffs_stage
-)
+spiffs_create_partition_image(storage "${CMAKE_CURRENT_LIST_DIR}/../spiffs" FLASH_IN_PROJECT)

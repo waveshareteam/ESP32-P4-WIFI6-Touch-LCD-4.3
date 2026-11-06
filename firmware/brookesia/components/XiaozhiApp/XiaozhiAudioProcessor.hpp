@@ -24,11 +24,11 @@
 namespace esp_brookesia::apps {
 
 /**
- * Dual-microphone WakeNet front end with an analog playback reference.
+ * Dual-microphone WakeNet front end with acoustic echo cancellation.
  *
- * Input is 16 kHz signed 16-bit interleaved MMR PCM: MIC1, MIC2, then the
- * MIC3 echo-reference channel. The PCM callback still receives the AFE's
- * single-channel 60 ms output frame.
+ * Input is 16 kHz signed 16-bit "MMR" PCM: MIC1, MIC2, then the speaker
+ * loopback reference. The AFE runs AEC and BSS, and the PCM callback
+ * receives its single-channel 60 ms output frame.
  */
 class XiaozhiAudioProcessor {
 public:
@@ -50,11 +50,18 @@ public:
     bool initialize();
     bool shutdown();
 
-    /** Feed frame_count interleaved MMR samples into the AFE. */
+    /** Feed frame_count interleaved "MMR" frames into the AFE. */
     bool feed(const int16_t *interleaved_pcm, size_t frame_count);
 
     bool enableWakeWord(bool enable);
     bool enableVoiceProcessing(bool enable);
+
+    /**
+     * Raise the wake word threshold while the device is speaking, so echo left after AEC
+     * of a TTS sentence that contains the wake phrase does not retrigger it; false restores
+     * the model default.
+     */
+    bool setWakeWordStrict(bool strict);
 
     bool isReady() const;
 
@@ -77,6 +84,8 @@ private:
         EVENT_WAKE_WORD_ENABLED | EVENT_VOICE_ENABLED;
 
     static constexpr uint32_t FETCH_TIMEOUT_MS = 250;
+    // WakeNet accepts 0.4 to 0.9999; a spoken wake word still clears this during playback.
+    static constexpr float STRICT_WAKE_WORD_THRESHOLD = 0.85f;
     static constexpr uint32_t PROCESS_TASK_STACK_SIZE = 8 * 1024;
     static constexpr UBaseType_t PROCESS_TASK_PRIORITY = 3;
     static constexpr size_t WAKE_WORD_CACHE_SAMPLES = SAMPLE_RATE * 2;
@@ -93,6 +102,7 @@ private:
     srmodel_list_t *models_ = nullptr;
     const esp_afe_sr_iface_t *afe_iface_ = nullptr;
     esp_afe_sr_data_t *afe_data_ = nullptr;
+    bool strict_wake_word_ = false; // Guarded by afe_mutex_
 
     std::atomic<bool> ready_{false};
     std::atomic<bool> shutting_down_{false};

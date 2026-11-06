@@ -32,10 +32,6 @@ LV_IMG_DECLARE(img_app_calculator);
 
 #define APP_NAME                "Calculator"
 
-// Adaptation for 360x360 round screen
-#define SCREEN_360_EFFECTIVE_WIDTH  320  // Effective display area for round screen
-#define SCREEN_360_EFFECTIVE_HEIGHT 320
-
 static const char *keyboard_map[] = {
     "C", "/", "x", LV_SYMBOL_BACKSPACE, "\n",
     "7", "8", "9", "-", "\n",
@@ -91,16 +87,7 @@ bool Calculator::run(void)
     _width = lv_area_get_width(&visual_area);
     _height = lv_area_get_height(&visual_area);
 
-    // Special handling for 360x360 round screen
-    bool is_round_screen = false;
-    int y_offset = 0;  // Vertical offset
-    if (_width == 360 && _height == 360) {
-        // Round screen, use smaller effective area
-        is_round_screen = true;
-        _width = SCREEN_360_EFFECTIVE_WIDTH;
-        _height = SCREEN_360_EFFECTIVE_HEIGHT;
-        y_offset = 20;  // Offset downward by 20 pixels to avoid round top
-    } else if (_width == 0 || _height == 0) {
+    if (_width == 0 || _height == 0) {
         _width = 400;
         _height = 600;
     }
@@ -120,12 +107,7 @@ bool Calculator::run(void)
     lv_obj_set_style_text_font(keyboard, KEYBOARD_FONT, 0);
     lv_obj_set_style_bg_color(keyboard, KEYBOARD_BG_COLOR, 0);
 
-    // Adjust keyboard position, round screen offset upward to avoid bottom occlusion
-    if (is_round_screen) {
-        lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, -30);  // Offset upward by 30 pixels
-    } else {
-        lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    }
+    lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     lv_obj_add_event_cb(keyboard, keyboard_event_cb, LV_EVENT_ALL, this);
     lv_btnmatrix_set_btn_ctrl(keyboard, 18, LV_BTNMATRIX_CTRL_CHECKED);
@@ -145,12 +127,7 @@ bool Calculator::run(void)
     lv_obj_t *label_obj = lv_obj_create(lv_scr_act());
     lv_obj_set_size(label_obj, _width, label_h);
 
-    // Adjust label area position, round screen offset downward to avoid top occlusion
-    if (is_round_screen) {
-        lv_obj_align(label_obj, LV_ALIGN_TOP_MID, 0, y_offset);
-    } else {
-        lv_obj_align(label_obj, LV_ALIGN_TOP_MID, 0, 0);
-    }
+    lv_obj_align(label_obj, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_set_style_radius(label_obj, 0, 0);
     lv_obj_set_style_border_width(label_obj, 0, 0);
@@ -167,12 +144,7 @@ bool Calculator::run(void)
     lv_obj_set_size(history_label, _width, text_h / 3);
     lv_obj_add_flag(history_label, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Round screen uses center alignment to avoid right edge occlusion
-    if (is_round_screen) {
-        lv_obj_set_style_text_align(history_label, LV_TEXT_ALIGN_CENTER, 0);
-    } else {
-        lv_obj_set_style_text_align(history_label, LV_TEXT_ALIGN_RIGHT, 0);
-    }
+    lv_obj_set_style_text_align(history_label, LV_TEXT_ALIGN_RIGHT, 0);
 
     lv_obj_set_style_opa(history_label, LV_OPA_TRANSP, LV_PART_CURSOR);
     lv_obj_set_style_text_color(history_label, LABEL_COLOR, 0);
@@ -189,14 +161,8 @@ bool Calculator::run(void)
     formula_label = lv_label_create(formula_label_obj);
     lv_obj_set_size(formula_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
 
-    // Round screen uses center alignment to avoid right edge occlusion
-    if (is_round_screen) {
-        lv_obj_align(formula_label, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_text_align(formula_label, LV_TEXT_ALIGN_CENTER, 0);
-    } else {
-        lv_obj_align(formula_label, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_obj_set_style_text_align(formula_label, LV_TEXT_ALIGN_RIGHT, 0);
-    }
+    lv_obj_align(formula_label, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_text_align(formula_label, LV_TEXT_ALIGN_RIGHT, 0);
 
     lv_obj_set_style_text_font(formula_label, LABEL_FONT_BIG, 0);
     lv_label_set_text(formula_label, "0");
@@ -211,14 +177,8 @@ bool Calculator::run(void)
     result_label = lv_label_create(result_label_obj);
     lv_obj_set_size(result_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
 
-    // Round screen uses center alignment to avoid right edge occlusion
-    if (is_round_screen) {
-        lv_obj_align(result_label, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_text_align(result_label, LV_TEXT_ALIGN_CENTER, 0);
-    } else {
-        lv_obj_align(result_label, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_obj_set_style_text_align(result_label, LV_TEXT_ALIGN_RIGHT, 0);
-    }
+    lv_obj_align(result_label, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_text_align(result_label, LV_TEXT_ALIGN_RIGHT, 0);
 
     lv_obj_set_style_text_color(result_label, LABEL_COLOR, 0);
     lv_obj_set_style_text_font(result_label, LABEL_FONT_SMALL, 0);
@@ -537,5 +497,11 @@ void Calculator::keyboard_event_cb(lv_event_t *e)
         }
     }
 }
+
+// The app is a singleton owned by itself; the registry must not delete it.
+ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, Calculator, APP_NAME, []()
+{
+    return std::shared_ptr<Calculator>(Calculator::requestInstance(), [](Calculator *) {});
+})
 
 }

@@ -1,10 +1,4 @@
 dependencies:
   idf:
-    version: ">=5.5,<6.0"
-
-  # Match the ESP-IDF 5.x host line used by this board's bundled C6 firmware.
-  espressif/esp_wifi_remote:
-    version: "0.14.5"
-
-  espressif/esp_hosted:
-    version: "1.4.7"
+    version: '>=5.5,<6.0'
+  waveshare/waveshare_boards: ^0.2.0

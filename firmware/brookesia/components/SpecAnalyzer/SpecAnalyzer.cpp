@@ -9,6 +9,7 @@
 #define ESP_UTILS_LOG_TAG "BS:SpecAnalyzer"
 #include "esp_lib_utils.h"
 #include "SpecAnalyzer.hpp"
+#include <algorithm>
 #include <cmath>
 #define APP_NAME "SpecAnalyzer"
 
@@ -35,8 +36,13 @@ SpecAnalyzer *SpecAnalyzer::requestInstance(bool use_status_bar, bool use_naviga
 
 SpecAnalyzer::SpecAnalyzer(bool use_status_bar, bool use_navigation_bar) :
     App(APP_NAME, &img_app_specanalyzer, true, use_status_bar, use_navigation_bar),
+    _mic_count(0),
+    _mic_channel_index{},
+    _canvas_width(0),
+    _canvas_height(0),
+    _channel_width(0),
     _canvas(nullptr),
-    _mic_label(nullptr),
+    _mic_labels{},
     _timer(nullptr),
     _audio_task_handle(nullptr),
     _audio_task_running(false),
@@ -65,8 +71,12 @@ bool SpecAnalyzer::run(void)
     lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
+    if (!loadLayout()) {
+        return false;
+    }
+
     // Prefer PSRAM for the large canvas buffer and fall back to SRAM if PSRAM is exhausted.
-    size_t buf_size = CANVAS_WIDTH * CANVAS_HEIGHT * sizeof(lv_color_t);
+    size_t buf_size = _canvas_width * _canvas_height * sizeof(lv_color_t);
     _draw_buf = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
 
     if (!_draw_buf) {
@@ -88,9 +98,9 @@ bool SpecAnalyzer::run(void)
         _draw_buf = nullptr;
         return false;
     }
-    lv_obj_set_size(_canvas, CANVAS_WIDTH, CANVAS_HEIGHT);
+    lv_obj_set_size(_canvas, _canvas_width, _canvas_height);
     lv_obj_align(_canvas, LV_ALIGN_CENTER, 0, 0);
-    lv_canvas_set_buffer(_canvas, _draw_buf, CANVAS_WIDTH, CANVAS_HEIGHT, LV_COLOR_FORMAT_RGB565);
+    lv_canvas_set_buffer(_canvas, _draw_buf, _canvas_width, _canvas_height, LV_COLOR_FORMAT_RGB565);
 
     // Initialize the ESP-DSP radix-2 FFT tables once before the audio task starts.
     esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
@@ -104,23 +114,16 @@ bool SpecAnalyzer::run(void)
     dsps_wind_hann_f32(_wind, N_SAMPLES);
     ESP_UTILS_LOGI("FFT and window initialized");
 
-    esp_err_t audio_ret = bsp_extra_codec_init();
+    esp_err_t audio_ret = board_codec_init();
     if (audio_ret != ESP_OK) {
         ESP_UTILS_LOGE("Audio codec init failed: %s", esp_err_to_name(audio_ret));
         close();
         return false;
     }
 
-    // Keep all four serialized slots and extract MIC1/MIC2 after the read.
-    audio_ret = bsp_extra_codec_set_voice_fs(
-        CODEC_VOICE_SAMPLE_RATE,
-        CODEC_DEFAULT_BIT_WIDTH,
-        TDM_SLOT_COUNT,
-        CAPTURE_TDM_SLOT_MASK,
-        MIC_GAIN_MASK
-    );
+    audio_ret = board_codec_set_voice_fs(CODEC_VOICE_SAMPLE_RATE, CODEC_DEFAULT_BIT_WIDTH);
     if (audio_ret != ESP_OK) {
-        ESP_UTILS_LOGE("Configure dual TDM microphone capture failed: %s", esp_err_to_name(audio_ret));
+        ESP_UTILS_LOGE("Configure microphone capture failed: %s", esp_err_to_name(audio_ret));
         close();
         return false;
     }
@@ -151,14 +154,67 @@ bool SpecAnalyzer::run(void)
         return false;
     }
 
-    _mic_label = lv_label_create(scr);
-    lv_label_set_text(_mic_label, _audio_task_running ? "Mic 1 / Mic 2" : "Mic unavailable");
-    lv_obj_set_style_text_color(_mic_label, lv_color_hex(0x00BFFF), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(_mic_label, lv_color_hex(0x222222), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(_mic_label, LV_OPA_70, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(_mic_label, 6, LV_PART_MAIN);
-    lv_obj_align_to(_mic_label, _canvas, LV_ALIGN_TOP_LEFT, 20, 12);
+    // Center each label over its channel so both stay inside the round panel.
+    constexpr uint32_t label_colors[MAX_MIC_COUNT] = { 0x00BFFF, 0xFF40FF };
+    for (int ch = 0; ch < _mic_count; ch++) {
+        _mic_labels[ch] = lv_label_create(scr);
+        lv_obj_set_style_text_color(_mic_labels[ch], lv_color_hex(label_colors[ch]), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(_mic_labels[ch], lv_color_hex(0x222222), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_mic_labels[ch], LV_OPA_70, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(_mic_labels[ch], 6, LV_PART_MAIN);
+        int channel_center_x = SIDE_MARGIN + ch * (_channel_width + CHANNEL_GAP) + _channel_width / 2;
+        lv_obj_align_to(_mic_labels[ch], _canvas, LV_ALIGN_TOP_MID, channel_center_x - _canvas_width / 2, 12);
+    }
+    setMicLabelText(_audio_task_running ? nullptr : "Mic unavailable");
 
+    return true;
+}
+
+void SpecAnalyzer::setMicLabelText(const char *status)
+{
+    static constexpr const char *mic_names[MAX_MIC_COUNT] = { "Mic 1", "Mic 2" };
+    for (int ch = 0; ch < _mic_count; ch++) {
+        if (_mic_labels[ch]) {
+            const char *name = (_mic_count == 1) ? "Mic" : mic_names[ch];
+            lv_label_set_text(_mic_labels[ch], status ? status : name);
+        }
+    }
+}
+
+bool SpecAnalyzer::loadLayout()
+{
+    // One or two channels, depending on how many microphones the board configuration declares.
+    board_mic_layout_t layout = {};
+    esp_err_t ret = board_audio_get_mic_layout(&layout);
+    if (ret != ESP_OK || layout.mic_num == 0) {
+        ESP_UTILS_LOGE("No microphone in the board configuration: %s", esp_err_to_name(ret));
+        return false;
+    }
+    if (layout.mic_num > MAX_MIC_COUNT) {
+        ESP_UTILS_LOGW("Board has %u microphones, showing the first %u",
+                       static_cast<unsigned>(layout.mic_num), static_cast<unsigned>(MAX_MIC_COUNT));
+    }
+    _mic_count = std::min<uint16_t>(layout.mic_num, MAX_MIC_COUNT);
+    for (int ch = 0; ch < _mic_count; ch++) {
+        if (layout.mic_channel_index[ch] >= CAPTURE_CHANNELS) {
+            ESP_UTILS_LOGE("Microphone %d sample %u is outside the capture frame", ch + 1,
+                           static_cast<unsigned>(layout.mic_channel_index[ch]));
+            return false;
+        }
+        _mic_channel_index[ch] = layout.mic_channel_index[ch];
+        ESP_UTILS_LOGI("Mic %d: %s, frame sample %u", ch + 1, layout.mic_label[ch],
+                       static_cast<unsigned>(_mic_channel_index[ch]));
+    }
+
+    lv_display_t *disp = lv_display_get_default();
+    if (!disp) {
+        ESP_UTILS_LOGE("LVGL display is not ready");
+        return false;
+    }
+    const int disp_h = lv_display_get_vertical_resolution(disp);
+    _canvas_width = lv_display_get_horizontal_resolution(disp);
+    _canvas_height = (disp_h >= 720) ? 360 : (disp_h / 2);
+    _channel_width = (_canvas_width - SIDE_MARGIN * 2 - CHANNEL_GAP * (_mic_count - 1)) / _mic_count;
     return true;
 }
 
@@ -185,9 +241,11 @@ bool SpecAnalyzer::close(void)
         _canvas = nullptr;
     }
 
-    if (_mic_label) {
-        lv_obj_del(_mic_label);
-        _mic_label = nullptr;
+    for (auto &label : _mic_labels) {
+        if (label) {
+            lv_obj_del(label);
+            label = nullptr;
+        }
     }
 
     if (_draw_buf) {
@@ -222,10 +280,8 @@ bool SpecAnalyzer::pause()
         }
     }
 
-    (void)bsp_extra_codec_dev_stop();
-    if (_mic_label) {
-        lv_label_set_text(_mic_label, "Mic paused");
-    }
+    (void)board_codec_dev_stop();
+    setMicLabelText("Mic paused");
     return true;
 }
 
@@ -238,24 +294,16 @@ bool SpecAnalyzer::resume()
         return true;
     }
 
-    esp_err_t ret = bsp_extra_codec_init();
+    esp_err_t ret = board_codec_init();
     if (ret == ESP_OK) {
-        ret = bsp_extra_codec_set_voice_fs(
-                  CODEC_VOICE_SAMPLE_RATE,
-                  CODEC_DEFAULT_BIT_WIDTH,
-                  TDM_SLOT_COUNT,
-                  CAPTURE_TDM_SLOT_MASK,
-                  MIC_GAIN_MASK
-              );
+        ret = board_codec_set_voice_fs(CODEC_VOICE_SAMPLE_RATE, CODEC_DEFAULT_BIT_WIDTH);
     }
     if (ret != ESP_OK) {
         ESP_UTILS_LOGE(
-            "Restore dual TDM microphone capture failed: %s",
+            "Restore microphone capture failed: %s",
             esp_err_to_name(ret)
         );
-        if (_mic_label) {
-            lv_label_set_text(_mic_label, "Mic unavailable");
-        }
+        setMicLabelText("Mic unavailable");
         return false;
     }
 
@@ -271,36 +319,28 @@ bool SpecAnalyzer::resume()
     );
     if (task_ret != pdPASS) {
         _audio_task_running = false;
-        (void)bsp_extra_codec_dev_stop();
-        if (_mic_label) {
-            lv_label_set_text(_mic_label, "Mic unavailable");
-        }
+        (void)board_codec_dev_stop();
+        setMicLabelText("Mic unavailable");
         return false;
     }
 
-    if (_mic_label) {
-        lv_label_set_text(_mic_label, "Mic 1 / Mic 2");
-    }
+    setMicLabelText(nullptr);
     if (_timer) {
         lv_timer_resume(_timer);
     }
     return true;
 }
 
-// The complete board-observed ES7210 TDM frame is [MIC1, MIC3 (echo), MIC2, MIC4].
+// Each captured ES7210 frame holds every input; the microphone samples come from the board layout.
 void SpecAnalyzer::audio_fft_task(void *pvParameters)
 {
     SpecAnalyzer *app = static_cast<SpecAnalyzer*>(pvParameters);
     size_t bytes_read = 0;
     constexpr size_t expected_bytes = N_SAMPLES * CAPTURE_CHANNELS * sizeof(int16_t);
-    constexpr size_t mic_slot_indices[MIC_COUNT] = {
-        PHYSICAL_MIC1_TDM_SLOT_INDEX,
-        PHYSICAL_MIC2_TDM_SLOT_INDEX,
-    };
     TickType_t last_slot_log_tick = xTaskGetTickCount();
 
     while (app->_audio_task_running) {
-        esp_err_t ret = bsp_extra_i2s_read(
+        esp_err_t ret = board_i2s_read(
             app->_raw_data,
             expected_bytes,
             &bytes_read,
@@ -312,8 +352,8 @@ void SpecAnalyzer::audio_fft_task(void *pvParameters)
                 ESP_UTILS_LOGW("I2S recorder is not available; stop spectrum capture");
                 lv_async_call([](void *param) {
                     SpecAnalyzer *self = static_cast<SpecAnalyzer *>(param);
-                    if (self && self->_mic_label) {
-                        lv_label_set_text(self->_mic_label, "Mic unavailable");
+                    if (self) {
+                        self->setMicLabelText("Mic unavailable");
                     }
                 }, app);
                 app->_audio_task_running = false;
@@ -343,24 +383,23 @@ void SpecAnalyzer::audio_fft_task(void *pvParameters)
                     }
                 }
             }
-            ESP_UTILS_LOGI(
-                "TDM peaks [MIC1, MIC3(echo), MIC2, MIC4]: %d, %d, %d, %d",
-                static_cast<int>(slot_peaks[0]), static_cast<int>(slot_peaks[1]),
-                static_cast<int>(slot_peaks[2]), static_cast<int>(slot_peaks[3])
-            );
+            for (int ch = 0; ch < app->_mic_count; ch++) {
+                ESP_UTILS_LOGI("Mic %d peak: %d", ch + 1,
+                               static_cast<int>(slot_peaks[app->_mic_channel_index[ch]]));
+            }
             last_slot_log_tick = now;
         }
 
         const size_t samples_read = bytes_read / sizeof(int16_t);
-        for (int ch = 0; ch < MIC_COUNT; ch++) {
+        for (int ch = 0; ch < app->_mic_count; ch++) {
             for (int i = 0; i < N_SAMPLES; i++) {
-                size_t sample_index = i * CAPTURE_CHANNELS + mic_slot_indices[ch];
+                size_t sample_index = i * CAPTURE_CHANNELS + app->_mic_channel_index[ch];
                 app->_audio_buffer[ch][i] = (sample_index < samples_read) ?
                                             (app->_raw_data[sample_index] / 32768.0f) : 0.0f;
             }
         }
 
-        for (int ch = 0; ch < MIC_COUNT; ch++) {
+        for (int ch = 0; ch < app->_mic_count; ch++) {
             // Apply the window in place before constructing the complex FFT input.
             dsps_mul_f32(app->_audio_buffer[ch], app->_wind, app->_audio_buffer[ch], N_SAMPLES, 1, 1, 1);
 
@@ -409,22 +448,19 @@ void SpecAnalyzer::timer_cb(lv_timer_t *timer)
     lv_canvas_init_layer(app->_canvas, &layer);
     lv_canvas_fill_bg(app->_canvas, lv_color_black(), LV_OPA_COVER);
 
-    const int side_margin = 20;
-    const int channel_gap = 24;
-    const int channel_width = (app->CANVAS_WIDTH - side_margin * 2 - channel_gap) / app->MIC_COUNT;
     const int bar_gap = 2;
-    int bar_width = channel_width / app->STRIPE_COUNT - bar_gap;
+    int bar_width = app->_channel_width / app->STRIPE_COUNT - bar_gap;
     if (bar_width < 1) {
         bar_width = 1;
     }
     const int bars_width = app->STRIPE_COUNT * bar_width + (app->STRIPE_COUNT - 1) * bar_gap;
-    const int base_y = app->CANVAS_HEIGHT - 20;                  // Bottom margin
-    const int max_bar_height = app->CANVAS_HEIGHT - 50;
+    const int base_y = app->_canvas_height - 20;                 // Bottom margin
+    const int max_bar_height = app->_canvas_height - 50;
     const int BASE_BAR_HEIGHT = 5;
 
-    for (int ch = 0; ch < app->MIC_COUNT; ch++) {
-        int channel_offset_x = side_margin + ch * (channel_width + channel_gap) +
-                               (channel_width - bars_width) / 2;
+    for (int ch = 0; ch < app->_mic_count; ch++) {
+        int channel_offset_x = app->SIDE_MARGIN + ch * (app->_channel_width + app->CHANNEL_GAP) +
+                               (app->_channel_width - bars_width) / 2;
 
         for (int i = 0; i < app->STRIPE_COUNT; i++) {
             // Normalize smoothed dB values from [-90, 0] to [0, 1].
@@ -508,5 +544,11 @@ void SpecAnalyzer::timer_cb(lv_timer_t *timer)
 
     lv_canvas_finish_layer(app->_canvas, &layer);
 }
+
+// The app is a singleton owned by itself; the registry must not delete it.
+ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, SpecAnalyzer, APP_NAME, []()
+{
+    return std::shared_ptr<SpecAnalyzer>(SpecAnalyzer::requestInstance(), [](SpecAnalyzer *) {});
+})
 
 } // namespace esp_brookesia::apps

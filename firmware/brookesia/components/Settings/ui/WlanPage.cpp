@@ -4,9 +4,10 @@
 
 #define ESP_UTILS_LOG_TAG "BS:WlanPage"
 #include "esp_lib_utils.h"
-#include "nvs.h"
+#include "esp_wifi.h"
 
-#include <stdlib.h>
+#include <algorithm>
+#include <string.h>
 
 LV_IMG_DECLARE(wifi_1);
 LV_IMG_DECLARE(wifi_2);
@@ -15,10 +16,67 @@ LV_IMG_DECLARE(wifi_4);
 
 namespace esp_brookesia::apps
 {
-    WlanPage *WlanPage::_instance = nullptr;
+    namespace
+    {
+        constexpr intptr_t DIALOG_ACTION_DISMISS = 0;
+        constexpr intptr_t DIALOG_ACTION_FORGET = 1;
+        constexpr lv_coord_t DIALOG_MAX_WIDTH = 560;
+        constexpr lv_coord_t INLINE_SPINNER_SIZE = 24;
 
-    lv_obj_t *WlanPage::ta = nullptr;
-    lv_obj_t *WlanPage::kb = nullptr;
+        lv_obj_t *create_inline_spinner(lv_obj_t *parent)
+        {
+            lv_obj_t *spinner = lv_spinner_create(parent);
+            lv_obj_set_size(spinner, INLINE_SPINNER_SIZE, INLINE_SPINNER_SIZE);
+            lv_obj_set_style_arc_width(spinner, 3, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(spinner, 3, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(spinner, lv_color_hex(settings_ui::COLOR_ACCENT), LV_PART_INDICATOR);
+            return spinner;
+        }
+
+        // Dim a control and ignore touches. LV_STATE_DISABLED is avoided because the theme's disabled
+        // recolor turns the dark rows light grey.
+        void set_row_enabled(lv_obj_t *obj, bool enabled)
+        {
+            if (enabled) {
+                lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_style_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+            } else {
+                lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_style_opa(obj, LV_OPA_40, LV_PART_MAIN);
+            }
+        }
+
+        const lv_image_dsc_t *signal_icon(int8_t rssi)
+        {
+            if (rssi >= -55) {
+                return &wifi_4;
+            }
+            if (rssi >= -67) {
+                return &wifi_3;
+            }
+            if (rssi >= -78) {
+                return &wifi_2;
+            }
+            return &wifi_1;
+        }
+
+        // Scanning while the station joins an AP makes the association fail.
+        bool link_is_joining()
+        {
+            board_wifi_link_t link = {};
+            board_wifi_service_get_link(&link);
+            return link.state == BOARD_WIFI_LINK_CONNECTING || link.state == BOARD_WIFI_LINK_ASSOCIATED;
+        }
+
+        void copy_ssid(char *dst, size_t dst_size, const uint8_t *src, size_t src_len)
+        {
+            size_t len = std::min(src_len, dst_size - 1);
+            memcpy(dst, src, len);
+            dst[len] = '\0';
+        }
+    } // namespace
+
+    WlanPage *WlanPage::_instance = nullptr;
 
     WlanPage *WlanPage::requestInstance(bool use_status_bar, bool use_navigation_bar)
     {
@@ -30,18 +88,8 @@ namespace esp_brookesia::apps
     }
 
     WlanPage::WlanPage(bool use_status_bar, bool use_navigation_bar)
-        : App("WLAN", nullptr, true, use_status_bar, use_navigation_bar),
-          page_root(nullptr), label(nullptr), list1(nullptr),
-          connected_text(nullptr), conn_btn(nullptr), available_text(nullptr)
+        : App("WLAN", nullptr, true, use_status_bar, use_navigation_bar)
     {
-        status_btn = nullptr;
-        wlan_switch = nullptr;
-        wifi_icon = nullptr;
-        spinner = nullptr;
-        password_title = nullptr;
-        wifi_TaskHandle = nullptr;
-        wifi_index = 0;
-        wifi_ssid = nullptr;
     }
 
     WlanPage::~WlanPage() {}
@@ -49,41 +97,25 @@ namespace esp_brookesia::apps
     bool WlanPage::run()
     {
         ESP_UTILS_LOGI("WlanPage Run");
-        page_active = true;
 
-        _nvs_param_map[NVS_KEY_WIFI_ENABLE] = false;
-        loadNvsParam();
-
-        start_wifi_events();
-        esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
-        }
-        ret = esp_wifi_start();
-        if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("esp_wifi_start failed: %s", esp_err_to_name(ret));
+        if (!board_wifi_service_is_ready()) {
+            ESP_UTILS_LOGE("Wi-Fi service is not available");
         }
 
-        CreateWifiUI();
+        subscribeEvents();
+        createUi();
 
-        // Restore the persisted Wi-Fi switch state after the UI exists.
-        if (_nvs_param_map[NVS_KEY_WIFI_ENABLE]) {
-            OpenWifi();
+        ui_timer = lv_timer_create(ui_timer_cb, UI_POLL_PERIOD_MS, this);
+        if (ui_timer == nullptr) {
+            ESP_UTILS_LOGE("Create WLAN UI timer failed");
         }
 
-        // The background task owns blocking scan/connect calls and posts UI work
-        // back to LVGL with lv_async_call.
-        if (wifi_TaskHandle == nullptr) {
-            wifi_task_running = true;
-            BaseType_t task_ret = xTaskCreate(wifi_task, "wifi_task", 6 * 1024, this, 9, &wifi_TaskHandle);
-            if (task_ret != pdPASS) {
-                wifi_task_running = false;
-                wifi_TaskHandle = nullptr;
-                ESP_UTILS_LOGE("Create Wi-Fi task failed");
-                return false;
-            }
+        if (board_wifi_service_is_enabled()) {
+            setUiState(UiState::Scanning);
+            requestScan();
+        } else {
+            setUiState(UiState::Off);
         }
-
         return true;
     }
 
@@ -98,54 +130,74 @@ namespace esp_brookesia::apps
     bool WlanPage::close()
     {
         ESP_UTILS_LOGI("WlanPage Close");
-        page_active = false;
-        wifi_task_running = false;
-        esp_wifi_scan_stop();
-        for (int i = 0; wifi_TaskHandle && i < 50; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        if (wifi_TaskHandle) {
-            ESP_UTILS_LOGW("wifi_task did not exit before page close finished");
+
+        if (ui_timer != nullptr) {
+            lv_timer_delete(ui_timer);
+            ui_timer = nullptr;
         }
 
-        if(wifi_events_registered)
-            stop_wifi_events();
-        if (page_root != nullptr)
-        {
-            lv_obj_del(page_root);
-            page_root = nullptr;
-            label = nullptr;
-            list1 = nullptr;
-            connected_text = nullptr;
-            conn_btn = nullptr;
-            available_text = nullptr;
-            status_btn = nullptr;
-            wlan_switch = nullptr;
-            wifi_icon = nullptr;
-            spinner = nullptr;
-            password_title = nullptr;
-            ta = nullptr;
-            kb = nullptr;
-            wifi_btns.clear();
-            settings_ui::reset_list_styles(style_list, style_list_btn, style_list_text, style_list_btn_pressed);
+        esp_wifi_service_scan_handle_t scan_handle = board_wifi_service_get_scan_handle();
+        if (scan_handle != nullptr) {
+            esp_wifi_service_scan_remove_cb(scan_handle, wifi_scan_done_cb);
         }
 
+        destroyUi();
+        memset(wifi_pwd, 0, sizeof(wifi_pwd));
+        memset(&previous_profile, 0, sizeof(previous_profile));
+        ui_state = UiState::Off;
+        scan_deferred = false;
         return true;
     }
 
-
-    void WlanPage::CreateWifiUI()
+    void WlanPage::subscribeEvents()
     {
+        if (events_subscribed) {
+            return;
+        }
+
+        // Subscribed for the lifetime of the page object: unsubscribing by event id would also drop
+        // the subscriptions of other apps.
+        esp_err_t ret = board_wifi_service_subscribe(BOARD_WIFI_EVENT_ANY, wifi_service_event_cb, this);
+        if (ret != ESP_OK) {
+            ESP_UTILS_LOGE("Subscribe Wi-Fi service events failed: %s", esp_err_to_name(ret));
+            return;
+        }
+        events_subscribed = true;
+    }
+
+    void WlanPage::createUi()
+    {
+        destroyUi();
         lv_obj_clean(lv_scr_act());
 
-        page_root = settings_ui::create_page(lv_scr_act());
-        status_btn = settings_ui::create_header(page_root, "WLAN", [](lv_event_t *e) {
+        page_root = settings_ui::create_page(lv_scr_act(), Settings::requestInstance()->getContentTopInset());
+        lv_obj_t *back_btn = settings_ui::create_header(page_root, "WLAN", [](lv_event_t *e) {
             (void)e;
             lv_async_call([](void *param) {
                 (void)param;
                 Settings::requestInstance()->showRootPage();
             }, nullptr);
         });
+
+        lv_obj_t *header = (back_btn != nullptr) ? lv_obj_get_parent(back_btn) : nullptr;
+        if (header != nullptr) {
+            refresh_btn = lv_button_create(header);
+            lv_obj_set_size(refresh_btn, settings_ui::HEADER_BUTTON_SIZE, settings_ui::HEADER_BUTTON_SIZE);
+            lv_obj_align(refresh_btn, LV_ALIGN_RIGHT_MID, -settings_ui::HEADER_BUTTON_EDGE_MARGIN, 0);
+            lv_obj_set_style_radius(refresh_btn, 8, LV_PART_MAIN);
+            lv_obj_set_style_border_width(refresh_btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(refresh_btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(refresh_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(settings_ui::COLOR_SURFACE_PRESSED), LV_STATE_PRESSED);
+            lv_obj_set_style_bg_opa(refresh_btn, LV_OPA_COVER, LV_STATE_PRESSED);
+            lv_obj_add_event_cb(refresh_btn, refresh_event_cb, LV_EVENT_CLICKED, this);
+
+            lv_obj_t *refresh_icon = lv_label_create(refresh_btn);
+            lv_label_set_text(refresh_icon, LV_SYMBOL_REFRESH);
+            lv_obj_set_style_text_font(refresh_icon, &lv_font_montserrat_26, LV_PART_MAIN);
+            lv_obj_set_style_text_color(refresh_icon, lv_color_hex(settings_ui::COLOR_PRIMARY_TEXT), LV_PART_MAIN);
+            lv_obj_center(refresh_icon);
+        }
 
         settings_ui::init_list_styles(style_list, style_list_btn, style_list_text, style_list_btn_pressed);
 
@@ -160,21 +212,10 @@ namespace esp_brookesia::apps
 
         wlan_switch = lv_switch_create(wlan_btn);
         lv_obj_set_size(wlan_switch, 64, 36);
-        lv_obj_remove_state(wlan_switch, LV_STATE_CHECKED);
-
-        lv_obj_add_event_cb(wlan_switch, [](lv_event_t *e)
-        {
-            lv_obj_t *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
-            bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
-            auto page = WlanPage::requestInstance();
-
-            if (checked) page->toggleWifiUI(WIFIOPEN);
-            else page->toggleWifiUI(WIFICLOSE);
-        },
-        LV_EVENT_VALUE_CHANGED, nullptr);
-
-        lv_obj_add_state(wlan_btn, LV_STATE_DISABLED);
-        // lv_obj_add_state(conn_btn, LV_STATE_DISABLED);
+        lv_obj_add_event_cb(wlan_switch, switch_event_cb, LV_EVENT_VALUE_CHANGED, this);
+        // Only the switch is interactive. LV_STATE_DISABLED would also grey out the switch because
+        // the theme's disabled recolor is applied to children.
+        lv_obj_remove_flag(wlan_btn, LV_OBJ_FLAG_CLICKABLE);
 
         lv_obj_update_layout(page_root);
         lv_coord_t content_width = lv_obj_get_width(page_root) - settings_ui::PAGE_HORIZONTAL_MARGIN * 2;
@@ -187,14 +228,6 @@ namespace esp_brookesia::apps
         if (content_width < 1) {
             content_width = 1;
         }
-
-        spinner = lv_spinner_create(page_root);
-        lv_obj_set_size(spinner, 72, 72);
-        lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 36);
-        lv_obj_add_flag(spinner, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_arc_width(spinner, 4, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(spinner, 4, LV_PART_INDICATOR);
-        lv_obj_set_style_arc_color(spinner, lv_color_hex(settings_ui::COLOR_ACCENT), LV_PART_INDICATOR);
 
         password_title = lv_label_create(page_root);
         lv_label_set_text(password_title, "Connect to network");
@@ -210,6 +243,7 @@ namespace esp_brookesia::apps
         lv_obj_set_size(ta, content_width, 64);
         lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, settings_ui::PAGE_HEADER_HEIGHT + 62);
 
+        lv_textarea_set_one_line(ta, true);
         lv_textarea_set_password_mode(ta, true);
         lv_textarea_set_max_length(ta, sizeof(wifi_pwd) - 1);
         lv_textarea_set_password_show_time(ta, 1500);
@@ -225,7 +259,6 @@ namespace esp_brookesia::apps
         lv_obj_set_style_text_font(ta, &lv_font_montserrat_20, LV_PART_TEXTAREA_PLACEHOLDER);
         lv_obj_set_style_bg_color(ta, lv_color_white(), LV_PART_CURSOR);
         lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
-        lv_obj_add_event_cb(ta, ta_event_cb, LV_EVENT_ALL, this);
 
         kb = lv_keyboard_create(page_root);
         lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
@@ -249,647 +282,751 @@ namespace esp_brookesia::apps
         lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_ALL, this);
     }
 
-    bool WlanPage::OpenWifi()
+    void WlanPage::destroyUi()
     {
-        ESP_UTILS_LOGI("WlanPage OpenWifi");
+        if (page_root == nullptr) {
+            return;
+        }
 
-        if (!wifi_events_registered) start_wifi_events();
+        lv_obj_del(page_root);
+        page_root = nullptr;
+        list1 = nullptr;
+        wlan_switch = nullptr;
+        refresh_btn = nullptr;
+        dialog = nullptr;
+        dialog_footer = nullptr;
+        password_title = nullptr;
+        ta = nullptr;
+        kb = nullptr;
+        connected_text = nullptr;
+        conn_btn = nullptr;
+        available_text = nullptr;
+        wifi_btns.clear();
+        settings_ui::reset_list_styles(style_list, style_list_btn, style_list_text, style_list_btn_pressed);
+    }
 
-        if (wlan_switch) {
+    void WlanPage::setUiState(UiState state)
+    {
+        ui_state = state;
+        if (state != UiState::Scanning) {
+            scan_deferred = false;
+        }
+        if (page_root == nullptr) {
+            return;
+        }
+
+        if (state != UiState::Password) {
+            hidePasswordInput();
+        }
+
+        if (state != UiState::Off) {
             lv_obj_add_state(wlan_switch, LV_STATE_CHECKED);
-            lv_obj_add_state(wlan_switch, LV_STATE_DISABLED);
-        }
-        if (spinner) {
-            lv_obj_remove_flag(spinner, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (list1) {
-            lv_obj_add_flag(list1, LV_OBJ_FLAG_HIDDEN);
-        }
-
-        Wifi_state = WIFIOPEN;
-
-        return true;
-    }
-
-    bool WlanPage::CloseWifi()
-    {
-        ESP_UTILS_LOGI("WlanPage CloseWifi");
-        Wifi_state = WIFICLOSE;
-
-        esp_wifi_disconnect();
-
-        if (connected_text)
-            lv_obj_add_flag(connected_text, LV_OBJ_FLAG_HIDDEN);
-        if (conn_btn)
-            lv_obj_add_flag(conn_btn, LV_OBJ_FLAG_HIDDEN);
-        if (available_text)
-            lv_obj_add_flag(available_text, LV_OBJ_FLAG_HIDDEN);
-        for (auto btn : wifi_btns)
-        {
-            if (btn)
-                lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
-        }
-
-        return true;
-    }
-
-    void WlanPage::toggleWifiUI(WifiState visible)
-    {
-        if (visible == WIFIOPEN)
-        {
-            _nvs_param_map[NVS_KEY_WIFI_ENABLE] = true;
-            setNvsParam(NVS_KEY_WIFI_ENABLE, true);
-            printf("WIFIOPEN \r\n");
-            OpenWifi();
-        }
-        else if(visible == WIFICLOSE) {
-            printf("WIFICLOSE \r\n");
-            _nvs_param_map[NVS_KEY_WIFI_ENABLE] = false;
-            setNvsParam(NVS_KEY_WIFI_ENABLE, false);
-            CloseWifi();
-        }
-    }
-    // Runs on the LVGL thread after Wi-Fi state changes.
-    void WlanPage::wifi_state_cb(void *param)
-    {
-        WlanPage *self = static_cast<WlanPage *>(param);
-        if (!self || !self->page_active || !self->list1) {
-            return;
-        }
-        if (self->kb) {
-            lv_obj_add_flag(self->kb, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (self->ta) {
-            lv_obj_add_flag(self->ta, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (self->password_title) {
-            lv_obj_add_flag(self->password_title, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (self->spinner) {
-            lv_obj_add_flag(self->spinner, LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_obj_remove_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
-        if (self->wlan_switch) {
-            lv_obj_remove_state(self->wlan_switch, LV_STATE_DISABLED);
-        }
-        if (self->status_btn) {
-            lv_obj_remove_state(self->status_btn, LV_STATE_DISABLED);
-        }
-
-
-        lv_timer_t *t = lv_timer_create(self->wifi_sta_cb, 100, self);
-        if (t) {
-            lv_timer_set_repeat_count(t, 1);
         } else {
-            ESP_UTILS_LOGW("Create Wi-Fi state refresh timer failed");
+            lv_obj_remove_state(wlan_switch, LV_STATE_CHECKED);
+        }
+        if (state == UiState::Connecting) {
+            lv_obj_add_state(wlan_switch, LV_STATE_DISABLED);
+        } else {
+            lv_obj_remove_state(wlan_switch, LV_STATE_DISABLED);
+        }
+
+        if (refresh_btn != nullptr) {
+            if (state == UiState::Idle || state == UiState::Scanning) {
+                lv_obj_remove_flag(refresh_btn, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(refresh_btn, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (state == UiState::Scanning) {
+                lv_obj_add_state(refresh_btn, LV_STATE_DISABLED);
+            } else {
+                lv_obj_remove_state(refresh_btn, LV_STATE_DISABLED);
+            }
+        }
+
+        // Connection progress is shown inline, so only the password editor hides the list.
+        if (state == UiState::Password) {
+            lv_obj_add_flag(list1, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(list1, LV_OBJ_FLAG_HIDDEN);
+            rebuildList();
         }
     }
 
-    // Handles AP list button events and owns the per-button user_data lifetime.
-    void WlanPage::wifi_btn_cb(lv_event_t * e)
+    void WlanPage::clearListRows()
     {
-        lv_event_code_t event_code = lv_event_get_code(e);
-        btn_user_data_t *ud = (btn_user_data_t *)lv_event_get_user_data(e);
-        if (!ud) {
-            return;
+        if (connected_text != nullptr) {
+            lv_obj_del(connected_text);
+            connected_text = nullptr;
         }
-        if (event_code == LV_EVENT_DELETE) {
-            free(ud);
-            return;
+        if (conn_btn != nullptr) {
+            lv_obj_del(conn_btn);
+            conn_btn = nullptr;
         }
-        WlanPage *page = static_cast<WlanPage *>(ud->self);
-        if (!page || !page->page_active) {
-            return;
+        if (available_text != nullptr) {
+            lv_obj_del(available_text);
+            available_text = nullptr;
         }
-        // When a network in the list is pressed
-        if(event_code == LV_EVENT_SHORT_CLICKED) {
-            page->wifi_index = ud->index;
-
-            ESP_UTILS_LOGI("wifi_index %d", page->wifi_index);
-
-            page->wifi_ssid = page->ap_info[page->wifi_index].ssid;
-            ESP_UTILS_LOGI("Selected SSID: %s", (const char *)page->wifi_ssid);
-
-            if (page->password_title) {
-                lv_label_set_text_fmt(page->password_title, "Connect to %s", (const char *)page->wifi_ssid);
-                lv_obj_remove_flag(page->password_title, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_textarea_set_text(ta, "");
-            lv_obj_add_flag(page->list1, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(ta, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_state(ta, LV_STATE_FOCUSED);
-            lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
-            lv_keyboard_set_textarea(kb, ta);
-
+        for (auto row : wifi_btns) {
+            lv_obj_del(row);
         }
+        wifi_btns.clear();
     }
 
-    // Rebuilds the connected/available AP list after a background scan completes.
-    void WlanPage::wifi_scan_cb(lv_timer_t * timer) {
+    lv_obj_t *WlanPage::addListRow(const char *text)
+    {
+        lv_obj_t *row = lv_list_add_button(list1, nullptr, text);
+        lv_obj_add_style(row, &style_list_btn, LV_PART_MAIN);
+        lv_obj_add_style(row, &style_list_btn_pressed, LV_STATE_PRESSED);
+        settings_ui::use_ellipsis_for_button_label(row);
+        return row;
+    }
 
-        WlanPage *self = static_cast<WlanPage *>(timer->user_data);
-        if (!self || !self->page_active || !self->list1) {
+    void WlanPage::addRowProgress(lv_obj_t *row, const char *text)
+    {
+        lv_obj_t *status = lv_label_create(row);
+        lv_label_set_text(status, text);
+        lv_obj_set_style_text_font(status, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(status, lv_color_hex(settings_ui::COLOR_SECONDARY_TEXT), LV_PART_MAIN);
+        create_inline_spinner(row);
+    }
+
+    void WlanPage::rebuildList()
+    {
+        if (list1 == nullptr) {
             return;
         }
 
-        if (self->connected_text) {
-            lv_obj_del(self->connected_text);
-            self->connected_text = nullptr;
+        const int32_t scroll_y = lv_obj_get_scroll_y(list1);
+        clearListRows();
+        board_wifi_link_t link = {};
+        board_wifi_service_get_link(&link);
+        rendered_link = link;
+        if (ui_state == UiState::Off) {
+            return;
         }
-        if (self->conn_btn) {
-            lv_obj_del(self->conn_btn);
-            self->conn_btn = nullptr;
-            self->wifi_icon = nullptr;
-        }
-        if (self->available_text) {
-            lv_obj_del(self->available_text);
-            self->available_text = nullptr;
-        }
-        for (auto btn : self->wifi_btns) {
-            if (btn) {
-                lv_obj_del(btn);
-            }
-        }
-        self->wifi_btns.clear();
 
-        // Connected WLAN
-        self->connected_text = lv_list_add_text(self->list1, "Connected WLAN");
-        lv_obj_add_style(self->connected_text, &self->style_list_text, LV_PART_MAIN);
-        lv_obj_add_flag(self->connected_text, LV_OBJ_FLAG_HIDDEN);
+        const bool connecting = ui_state == UiState::Connecting;
+        const bool scanning = ui_state == UiState::Scanning;
 
-        self->conn_btn = lv_list_add_button(self->list1, nullptr, "SSID");
-        lv_obj_add_style(self->conn_btn, &self->style_list_btn, LV_PART_MAIN);
-        settings_ui::use_ellipsis_for_button_label(self->conn_btn);
-        lv_obj_add_flag(self->conn_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(self->conn_btn, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_add_event_cb(self->conn_btn, [](lv_event_t *e)
-        {
-            lv_event_code_t event_code = lv_event_get_code(e);
-            auto page = WlanPage::requestInstance();
-
-            // When a network in the list is pressed
-            if(event_code == LV_EVENT_SHORT_CLICKED) {
-                ESP_LOGI("WIFI", "LV_EVENT_SHORT_CLICKED");
-                esp_err_t ret = esp_wifi_restore();
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_restore failed: %s", esp_err_to_name(ret));
-                }
-                ret = esp_wifi_set_mode(WIFI_MODE_STA);
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
-                }
-                ret = esp_wifi_start();
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_start failed: %s", esp_err_to_name(ret));
-                }
-                page->Wifi_state = DISCONNECT;
-                page->connection_num = 0;
-                if (page->connected_text) {
-                    lv_obj_add_flag(page->connected_text, LV_OBJ_FLAG_HIDDEN);
-                }
-                if (page->conn_btn) {
-                    lv_obj_add_flag(page->conn_btn, LV_OBJ_FLAG_HIDDEN);
+        // The board tracks the link from boot, so an automatic connection that started before the
+        // page opened is listed too.
+        const char *link_ssid = connecting ? connecting_ssid : link.ssid;
+        if (connecting || link.state != BOARD_WIFI_LINK_IDLE) {
+            connected_text = settings_ui::add_section(list1, "Connected WLAN", style_list_text);
+            conn_btn = addListRow(link_ssid);
+            if (connecting || link.state == BOARD_WIFI_LINK_CONNECTING) {
+                lv_obj_remove_flag(conn_btn, LV_OBJ_FLAG_CLICKABLE);
+                addRowProgress(conn_btn, "Connecting...");
+            } else {
+                lv_obj_add_event_cb(conn_btn, conn_btn_event_cb, LV_EVENT_CLICKED, this);
+                if (link.state == BOARD_WIFI_LINK_GOT_IP) {
+                    lv_obj_t *state_icon = lv_label_create(conn_btn);
+                    lv_label_set_text(state_icon, LV_SYMBOL_OK);
+                    lv_obj_set_style_text_font(state_icon, &lv_font_montserrat_26, LV_PART_MAIN);
+                } else {
+                    // Associated but still waiting for an address.
+                    addRowProgress(conn_btn, "Obtaining IP...");
                 }
             }
-        },
-        LV_EVENT_SHORT_CLICKED, nullptr);
-
-        self->wifi_icon = lv_label_create(self->conn_btn);
-        lv_label_set_text(self->wifi_icon, LV_SYMBOL_CLOSE);
-        lv_obj_set_style_text_font(self->wifi_icon, &lv_font_montserrat_26, LV_PART_MAIN);
-        // Available WLAN
-        self->available_text = lv_list_add_text(self->list1, "Available WLAN");
-        lv_obj_add_style(self->available_text, &self->style_list_text, LV_PART_MAIN);
-
-        uint16_t display_count = self->scanned_ap_count;
-        if (display_count > DEFAULT_SCAN_LIST_SIZE) {
-            display_count = DEFAULT_SCAN_LIST_SIZE;
         }
 
-        for (int i = 0; i < display_count; i++)
-        {
-            if (self->ap_info[i].ssid[0] == '\0') {
+        available_text = settings_ui::add_section(list1, "Available WLAN", style_list_text);
+
+        // Previous results stay visible while a new scan runs, so say that one is in progress.
+        if (scanning) {
+            lv_obj_t *hint = lv_list_add_text(list1, scan_deferred ? "Waiting for connection to finish..." : "Scanning...");
+            lv_obj_add_style(hint, &style_list_text, LV_PART_MAIN);
+            wifi_btns.push_back(hint);
+        }
+
+        size_t shown = 0;
+        for (size_t i = 0; i < ap_list.size(); ++i) {
+            const ApInfo &ap = ap_list[i];
+            if (strcmp(ap.ssid, link_ssid) == 0) {
                 continue;
             }
-            lv_obj_t *wifi_btn = lv_list_add_button(self->list1, nullptr, (const char *)self->ap_info[i].ssid);
-            lv_obj_add_style(wifi_btn, &self->style_list_btn, LV_PART_MAIN);
-            lv_obj_add_style(wifi_btn, &self->style_list_btn_pressed, LV_STATE_PRESSED);
-            settings_ui::use_ellipsis_for_button_label(wifi_btn);
+
+            lv_obj_t *wifi_btn = addListRow(ap.ssid);
+            lv_obj_set_user_data(wifi_btn, reinterpret_cast<void *>(i));
+            lv_obj_add_event_cb(wifi_btn, ap_btn_event_cb, LV_EVENT_CLICKED, this);
 
             lv_obj_t *icon = lv_image_create(wifi_btn);
-            if (self->ap_info[i].rssi > -25)
-                lv_img_set_src(icon, &wifi_4);
-            else if ((self->ap_info[i].rssi < -25) && (self->ap_info[i].rssi > -50))  // Medium signal
-                // Add button with medium signal icon
-               lv_img_set_src(icon, &wifi_3);
-            else if ((self->ap_info[i].rssi < -50) && (self->ap_info[i].rssi > -75))  // Medium signal
-                // Add button with weak signal icon
-                lv_img_set_src(icon, &wifi_2);
-            else lv_img_set_src(icon, &wifi_1);
+            lv_image_set_src(icon, signal_icon(ap.rssi));
 
-            btn_user_data_t *ud = (btn_user_data_t *)malloc(sizeof(btn_user_data_t));
-            if (!ud) {
-                ESP_UTILS_LOGW("Allocate Wi-Fi button user data failed");
-                lv_obj_del(wifi_btn);
+            // Other networks cannot be picked while a connection started from this page is running.
+            set_row_enabled(wifi_btn, !connecting);
+            wifi_btns.push_back(wifi_btn);
+            shown++;
+        }
+
+        if (shown == 0 && !scanning) {
+            lv_obj_t *hint = lv_list_add_text(list1, connecting ? "Connecting to network..." : "No networks found");
+            lv_obj_add_style(hint, &style_list_text, LV_PART_MAIN);
+            wifi_btns.push_back(hint);
+        }
+
+        // Rebuilding recreates every row; keep the user's place in the list.
+        lv_obj_update_layout(list1);
+        lv_obj_scroll_to_y(list1, scroll_y, LV_ANIM_OFF);
+    }
+
+    void WlanPage::showPasswordInput(const ApInfo &ap)
+    {
+        selected_ap = ap;
+        setUiState(UiState::Password);
+
+        lv_label_set_text_fmt(password_title, "Connect to %s", ap.ssid);
+        lv_obj_remove_flag(password_title, LV_OBJ_FLAG_HIDDEN);
+        lv_textarea_set_text(ta, "");
+        lv_obj_remove_flag(ta, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_state(ta, LV_STATE_FOCUSED);
+        lv_keyboard_set_textarea(kb, ta);
+        lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void WlanPage::hidePasswordInput()
+    {
+        if (password_title != nullptr) {
+            lv_obj_add_flag(password_title, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ta != nullptr) {
+            lv_textarea_set_text(ta, "");
+            lv_obj_add_flag(ta, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (kb != nullptr) {
+            lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void WlanPage::createDialog(const char *title, const char *text)
+    {
+        closeDialog(false);
+        if (page_root == nullptr) {
+            return;
+        }
+
+        // Owned by the page (not lv_layer_top) so it never shows over other apps and is deleted with
+        // the page. The backdrop swallows touches meant for the page behind it.
+        dialog = lv_obj_create(page_root);
+        lv_obj_remove_style_all(dialog);
+        lv_obj_set_size(dialog, lv_pct(100), lv_pct(100));
+        lv_obj_set_style_bg_color(dialog, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(dialog, LV_OPA_60, LV_PART_MAIN);
+        lv_obj_add_flag(dialog, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_coord_t width = lv_obj_get_width(page_root) - settings_ui::PAGE_HORIZONTAL_MARGIN * 2;
+        if (width > DIALOG_MAX_WIDTH) {
+            width = DIALOG_MAX_WIDTH;
+        }
+
+        lv_obj_t *panel = lv_obj_create(dialog);
+        lv_obj_remove_style_all(panel);
+        lv_obj_set_size(panel, width, LV_SIZE_CONTENT);
+        lv_obj_center(panel);
+        lv_obj_set_style_bg_color(panel, lv_color_hex(settings_ui::COLOR_SURFACE), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(panel, lv_color_hex(settings_ui::COLOR_BORDER), LV_PART_MAIN);
+        lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(panel, 12, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(panel, 28, LV_PART_MAIN);
+        lv_obj_set_style_pad_row(panel, 16, LV_PART_MAIN);
+        lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title_label = lv_label_create(panel);
+        lv_label_set_text(title_label, title);
+        lv_label_set_long_mode(title_label, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(title_label, lv_pct(100));
+        lv_obj_set_style_text_font(title_label, &lv_font_montserrat_26, LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_label, lv_color_hex(settings_ui::COLOR_PRIMARY_TEXT), LV_PART_MAIN);
+
+        lv_obj_t *text_label = lv_label_create(panel);
+        lv_label_set_text(text_label, text);
+        lv_label_set_long_mode(text_label, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_width(text_label, lv_pct(100));
+        lv_obj_set_style_text_font(text_label, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(text_label, lv_color_hex(settings_ui::COLOR_SECONDARY_TEXT), LV_PART_MAIN);
+
+        dialog_footer = lv_obj_create(panel);
+        lv_obj_remove_style_all(dialog_footer);
+        lv_obj_set_size(dialog_footer, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_top(dialog_footer, 8, LV_PART_MAIN);
+        lv_obj_set_style_pad_column(dialog_footer, 12, LV_PART_MAIN);
+        lv_obj_set_flex_flow(dialog_footer, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(dialog_footer, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(dialog_footer, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_move_foreground(dialog);
+    }
+
+    void WlanPage::addDialogButton(const char *text, intptr_t action, bool primary)
+    {
+        if (dialog_footer == nullptr) {
+            return;
+        }
+
+        lv_obj_t *btn = lv_button_create(dialog_footer);
+        lv_obj_set_size(btn, LV_SIZE_CONTENT, 56);
+        lv_obj_set_style_pad_hor(btn, 28, LV_PART_MAIN);
+        lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+        lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(primary ? settings_ui::COLOR_ACCENT : settings_ui::COLOR_SURFACE_PRESSED),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(settings_ui::COLOR_BORDER), LV_STATE_PRESSED);
+        lv_obj_set_user_data(btn, reinterpret_cast<void *>(action));
+        lv_obj_add_event_cb(btn, dialog_btn_event_cb, LV_EVENT_CLICKED, this);
+
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_22, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_hex(settings_ui::COLOR_PRIMARY_TEXT), LV_PART_MAIN);
+        lv_obj_center(label);
+    }
+
+    void WlanPage::closeDialog(bool async)
+    {
+        if (dialog == nullptr) {
+            return;
+        }
+        if (async) {
+            // Called from a dialog button: the button must outlive its own event.
+            lv_obj_delete_async(dialog);
+        } else {
+            lv_obj_delete(dialog);
+        }
+        dialog = nullptr;
+        dialog_footer = nullptr;
+    }
+
+    void WlanPage::showMessage(const char *title, const char *text)
+    {
+        createDialog(title, text);
+        addDialogButton("OK", DIALOG_ACTION_DISMISS, true);
+    }
+
+    void WlanPage::showForgetConfirm()
+    {
+        board_wifi_link_t link = {};
+        board_wifi_service_get_link(&link);
+        if (link.state != BOARD_WIFI_LINK_ASSOCIATED && link.state != BOARD_WIFI_LINK_GOT_IP) {
+            return;
+        }
+
+        createDialog(link.ssid, "Forget this network? The saved password will be removed.");
+        addDialogButton("Cancel", DIALOG_ACTION_DISMISS, false);
+        addDialogButton("Forget", DIALOG_ACTION_FORGET, true);
+    }
+
+    void WlanPage::requestScan()
+    {
+        if (link_is_joining()) {
+            if (!scan_deferred) {
+                ESP_UTILS_LOGI("Wi-Fi is connecting, defer scan until the attempt finishes");
+                scan_deferred = true;
+                if (ui_state == UiState::Scanning) {
+                    rebuildList();  // Show the waiting hint instead of "Scanning..."
+                }
+            }
+            return;
+        }
+        scan_deferred = false;
+
+        esp_wifi_service_scan_handle_t scan_handle = board_wifi_service_get_scan_handle();
+        esp_err_t ret = ESP_ERR_INVALID_STATE;
+        if (scan_handle != nullptr) {
+            ret = esp_wifi_service_scan_request(scan_handle, nullptr, wifi_scan_done_cb, this);
+        }
+        if (ret != ESP_OK) {
+            ESP_UTILS_LOGW("Request Wi-Fi scan failed: %s", esp_err_to_name(ret));
+            if (ui_state == UiState::Scanning) {
+                setUiState(UiState::Idle);
+            }
+        }
+    }
+
+    void WlanPage::startConnect(const ApInfo &ap, const char *password)
+    {
+        esp_wifi_service_profile_mgr_t profile_mgr = board_wifi_service_get_profile_manager();
+        if (profile_mgr == nullptr) {
+            showMessage("Wi-Fi unavailable", "The Wi-Fi service is not running.");
+            setUiState(UiState::Idle);
+            return;
+        }
+
+        strlcpy(connecting_ssid, ap.ssid, sizeof(connecting_ssid));
+        strlcpy(wifi_pwd, password ? password : "", sizeof(wifi_pwd));
+
+        // Remember an existing profile so a failed attempt with a new password can be rolled back.
+        restore_profile_on_fail =
+            esp_wifi_service_profile_mgr_get(profile_mgr, connecting_ssid, &previous_profile) == ESP_OK;
+        {
+            board_wifi_link_t link = {};
+            board_wifi_service_get_link(&link);
+            // Reconnecting to the current SSID first disconnects from it; that event is not a failure.
+            ignore_next_disconnect = (link.state == BOARD_WIFI_LINK_ASSOCIATED ||
+                                      link.state == BOARD_WIFI_LINK_GOT_IP) &&
+                                     strcmp(link.ssid, connecting_ssid) == 0;
+        }
+        pending_events.fetch_and(~(PENDING_CONNECTED | PENDING_DISCONNECTED | PENDING_GOT_IP | PENDING_CONNECT_FAILED));
+
+        ESP_UTILS_LOGI("Connect to SSID: %s", connecting_ssid);
+        setUiState(UiState::Connecting);
+        connect_start_tick = lv_tick_get();
+
+        esp_err_t ret = board_wifi_service_request_connect(connecting_ssid, wifi_pwd, CONNECT_PRIORITY, 0);
+        memset(wifi_pwd, 0, sizeof(wifi_pwd));
+        if (ret != ESP_OK) {
+            ESP_UTILS_LOGW("Request Wi-Fi connect failed: %s", esp_err_to_name(ret));
+            finishConnect(false);
+        }
+    }
+
+    void WlanPage::finishConnect(bool success, bool abort_attempt)
+    {
+        if (success) {
+            ESP_UTILS_LOGI("Connected to SSID: %s", connecting_ssid);
+        } else {
+            ESP_UTILS_LOGW("Connect to SSID %s failed", connecting_ssid);
+
+            esp_wifi_service_profile_mgr_t profile_mgr = board_wifi_service_get_profile_manager();
+            if (profile_mgr != nullptr) {
+                // Do not keep retrying credentials that never worked.
+                if (restore_profile_on_fail) {
+                    (void)esp_wifi_service_profile_mgr_add(profile_mgr, &previous_profile);
+                } else {
+                    (void)esp_wifi_service_profile_mgr_delete(profile_mgr, connecting_ssid);
+                }
+            }
+            if (abort_attempt) {
+                // The driver may still be trying the old credentials.
+                (void)esp_wifi_disconnect();
+            }
+            // Let the selector fall back to other saved networks.
+            esp_err_t ret = board_wifi_service_request_reeval();
+            if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
+                ESP_UTILS_LOGW("Request Wi-Fi re-evaluation failed: %s", esp_err_to_name(ret));
+            }
+
+            char text[96];
+            snprintf(text, sizeof(text), "Unable to connect to %s. Check the password and try again.", connecting_ssid);
+            showMessage("Connection failed", text);
+        }
+
+        memset(&previous_profile, 0, sizeof(previous_profile));
+        restore_profile_on_fail = false;
+        ignore_next_disconnect = false;
+        connecting_ssid[0] = '\0';
+        setUiState(UiState::Idle);
+    }
+
+    void WlanPage::forgetConnectedNetwork()
+    {
+        board_wifi_link_t link = {};
+        board_wifi_service_get_link(&link);
+        if (link.state != BOARD_WIFI_LINK_ASSOCIATED && link.state != BOARD_WIFI_LINK_GOT_IP) {
+            return;
+        }
+        const char *current_ssid = link.ssid;
+
+        esp_wifi_service_profile_mgr_t profile_mgr = board_wifi_service_get_profile_manager();
+        if (profile_mgr != nullptr) {
+            esp_err_t ret = esp_wifi_service_profile_mgr_delete(profile_mgr, current_ssid);
+            if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
+                ESP_UTILS_LOGW("Delete Wi-Fi profile failed: %s", esp_err_to_name(ret));
+            }
+        }
+        ESP_UTILS_LOGI("Forget SSID: %s", current_ssid);
+        // The selector re-evaluates the remaining profiles after the disconnect event.
+        (void)esp_wifi_disconnect();
+    }
+
+    void WlanPage::applyScanRecords()
+    {
+        std::vector<wifi_ap_record_t> records;
+        esp_err_t scan_err = ESP_OK;
+        {
+            std::lock_guard<std::mutex> lock(shared_mutex);
+            records.swap(scan_records);
+            scan_err = scan_error;
+        }
+        if (scan_err != ESP_OK) {
+            ESP_UTILS_LOGW("Wi-Fi scan failed: %s", esp_err_to_name(scan_err));
+        }
+
+        // Keep the strongest entry per SSID.
+        std::vector<ApInfo> results;
+        for (const wifi_ap_record_t &record : records) {
+            if (record.ssid[0] == '\0') {
                 continue;
             }
+            ApInfo ap = {};
+            copy_ssid(ap.ssid, sizeof(ap.ssid), record.ssid, strnlen((const char *)record.ssid, sizeof(record.ssid)));
+            ap.rssi = record.rssi;
+            ap.authmode = record.authmode;
 
-            ud->index = i;
-            ud->self = self;
-            lv_obj_add_event_cb(wifi_btn,wifi_btn_cb, LV_EVENT_ALL, ud);
+            auto it = std::find_if(results.begin(), results.end(), [&ap](const ApInfo &item) {
+                return strcmp(item.ssid, ap.ssid) == 0;
+            });
+            if (it == results.end()) {
+                results.push_back(ap);
+            } else if (ap.rssi > it->rssi) {
+                *it = ap;
+            }
+        }
+        std::sort(results.begin(), results.end(), [](const ApInfo &a, const ApInfo &b) {
+            return a.rssi > b.rssi;
+        });
+        if (results.size() > MAX_AP_NUM) {
+            results.resize(MAX_AP_NUM);
+        }
+        ESP_UTILS_LOGI("Wi-Fi scan done: %u records, %u networks",
+                       static_cast<unsigned>(records.size()), static_cast<unsigned>(results.size()));
+        ap_list.swap(results);
+    }
 
-            self->wifi_btns.push_back(wifi_btn);
+    void WlanPage::processPendingEvents()
+    {
+        const uint32_t events = pending_events.exchange(0);
+
+        if (scan_deferred && ui_state == UiState::Scanning && !link_is_joining()) {
+            requestScan();
+            // The hint changes from "Waiting..." to "Scanning..."; the link check below may not rebuild.
+            rebuildList();
         }
 
-        lv_obj_remove_state(self->wlan_switch, LV_STATE_DISABLED);
-        lv_obj_remove_state(self->status_btn, LV_STATE_DISABLED);
-        lv_obj_add_flag(self->spinner, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
+        if (events & PENDING_SCAN_DONE) {
+            applyScanRecords();
+            if (ui_state == UiState::Scanning) {
+                setUiState(UiState::Idle);
+            } else if (ui_state == UiState::Idle) {
+                rebuildList();
+            }
+        }
 
-        static wifi_config_t wifi_config;
-        esp_err_t ret = esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
-        if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("esp_wifi_get_config failed: %s", esp_err_to_name(ret));
+        if (ui_state == UiState::Connecting) {
+            board_wifi_link_t link = {};
+            board_wifi_service_get_link(&link);
+            const bool target_connected = link.state == BOARD_WIFI_LINK_GOT_IP &&
+                                          strcmp(link.ssid, connecting_ssid) == 0;
+            bool target_disconnected = false;
+            {
+                std::lock_guard<std::mutex> lock(shared_mutex);
+                target_disconnected = strcmp(disconnected_ssid, connecting_ssid) == 0;
+            }
+
+            if ((events & PENDING_GOT_IP) && target_connected) {
+                finishConnect(true);
+            } else if ((events & PENDING_DISCONNECTED) && target_disconnected) {
+                if (ignore_next_disconnect) {
+                    ignore_next_disconnect = false;
+                } else {
+                    finishConnect(false);
+                }
+            } else if (events & PENDING_CONNECT_FAILED) {
+                finishConnect(false);
+            } else if (lv_tick_elaps(connect_start_tick) > CONNECT_TIMEOUT_MS) {
+                finishConnect(false, true);
+            }
             return;
         }
 
-        ESP_UTILS_LOGI("SSID stored in NVS: %s", wifi_config.sta.ssid);
-        const bool has_stored_ssid = wifi_config.sta.ssid[0] != '\0';
-        if (self->Wifi_state == CONNECTED && has_stored_ssid) {
-            ESP_LOGI("WIFI", "Connected to SSID: %s", wifi_config.sta.ssid);
-            self->wifi_ssid = wifi_config.sta.ssid;
-            lv_obj_remove_flag(self->connected_text, LV_OBJ_FLAG_HIDDEN);
-            lv_list_set_button_text(self->list1, self->conn_btn, (const char*)wifi_config.sta.ssid);
-            lv_obj_remove_flag(self->conn_btn, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(self->wifi_icon, LV_SYMBOL_OK);
-        } else {
-            ESP_LOGI("WIFI", "Not connected");
-            if (has_stored_ssid && self->_nvs_param_map[NVS_KEY_WIFI_ENABLE]) {
-                printf("Wi-Fi ssid exists\n");
-                self->wifi_ssid = wifi_config.sta.ssid;
-
-                lv_obj_remove_flag(self->spinner, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_state(self->wlan_switch, LV_STATE_DISABLED);
-                lv_obj_add_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
-
-                ret = esp_wifi_connect();
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_connect failed: %s", esp_err_to_name(ret));
-                    lv_async_call(wifi_state_cb, self);
-                }
-            } else {
-                printf("Wi-Fi ssid empty\n");
+        // Compare against the board link snapshot each tick; this also covers attempts the selector
+        // starts on its own.
+        if (ui_state == UiState::Idle || ui_state == UiState::Scanning) {
+            board_wifi_link_t link = {};
+            board_wifi_service_get_link(&link);
+            if (link.state != rendered_link.state || strcmp(link.ssid, rendered_link.ssid) != 0) {
+                rebuildList();
             }
         }
     }
 
-    // One-shot UI refresh after a connect attempt completes or times out.
-    void WlanPage::wifi_sta_cb(lv_timer_t * timer) {
-
-        WlanPage *self = static_cast<WlanPage *>(timer->user_data);
-        if (!self || !self->page_active || !self->list1 || !self->connected_text || !self->conn_btn || !self->wifi_icon) {
-            return;
-        }
-        if (self->wifi_ssid == nullptr || self->wifi_ssid[0] == '\0') {
-            lv_obj_add_flag(self->connected_text, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(self->conn_btn, LV_OBJ_FLAG_HIDDEN);
+    void WlanPage::wifi_service_event_cb(const adf_event_t *event, void *ctx)
+    {
+        WlanPage *self = static_cast<WlanPage *>(ctx);
+        if (self == nullptr || event == nullptr) {
             return;
         }
 
-        lv_obj_remove_flag(self->connected_text, LV_OBJ_FLAG_HIDDEN);
-        lv_list_set_button_text(self->list1, self->conn_btn, (const char*)self->wifi_ssid);
-        if (self->Wifi_state == CONNECTED)
-        {
-            lv_label_set_text(self->wifi_icon, LV_SYMBOL_OK);
-            lv_obj_remove_flag(self->conn_btn, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_remove_flag(self->conn_btn, LV_OBJ_FLAG_HIDDEN);
-
+        uint32_t pending = 0;
+        switch (event->event_id) {
+        case BOARD_WIFI_EVENT_CONNECTED:
+            pending = PENDING_CONNECTED;
+            break;
+        case BOARD_WIFI_EVENT_DISCONNECTED: {
+            std::lock_guard<std::mutex> lock(self->shared_mutex);
+            self->disconnected_ssid[0] = '\0';
+            if (event->payload != nullptr && event->payload_len >= sizeof(wifi_event_sta_disconnected_t)) {
+                auto *info = static_cast<const wifi_event_sta_disconnected_t *>(event->payload);
+                copy_ssid(self->disconnected_ssid, sizeof(self->disconnected_ssid), info->ssid, info->ssid_len);
+            }
+            pending = PENDING_DISCONNECTED;
+            break;
         }
-        else
+        case BOARD_WIFI_EVENT_STA_GOT_IP:
+            pending = PENDING_GOT_IP;
+            break;
+        case BOARD_WIFI_EVENT_STA_LOST_IP:
+            pending = PENDING_LOST_IP;
+            break;
+        case BOARD_WIFI_EVENT_SELECTOR_SWITCH_FAILED:
+            pending = PENDING_CONNECT_FAILED;
+            break;
+        default:
+            return;
+        }
+        self->pending_events.fetch_or(pending);
+    }
+
+    // Runs in the event loop task: copy the raw records only, the LVGL timer does the rest.
+    void WlanPage::wifi_scan_done_cb(esp_err_t scan_err, uint16_t ap_count, const wifi_ap_record_t *ap_records, void *ctx)
+    {
+        WlanPage *self = static_cast<WlanPage *>(ctx);
+        if (self == nullptr) {
+            return;
+        }
+
         {
-            lv_label_set_text(self->wifi_icon, LV_SYMBOL_CLOSE);
-            lv_obj_add_flag(self->conn_btn, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_remove_flag(self->conn_btn, LV_OBJ_FLAG_HIDDEN);
+            std::lock_guard<std::mutex> lock(self->shared_mutex);
+            self->scan_error = scan_err;
+            if (scan_err == ESP_OK && ap_records != nullptr) {
+                self->scan_records.assign(ap_records, ap_records + ap_count);
+            } else {
+                self->scan_records.clear();
+            }
+        }
+        self->pending_events.fetch_or(PENDING_SCAN_DONE);
+    }
+
+    void WlanPage::ui_timer_cb(lv_timer_t *timer)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_timer_get_user_data(timer));
+        if (self != nullptr) {
+            self->processPendingEvents();
         }
     }
 
-    // Keyboard READY/CANCEL hides the input and lets wifi_task perform the blocking connect.
+    void WlanPage::switch_event_cb(lv_event_t *e)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
+        lv_obj_t *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
+        if (self == nullptr || sw == nullptr) {
+            return;
+        }
+
+        const bool enable = lv_obj_has_state(sw, LV_STATE_CHECKED);
+        esp_err_t ret = board_wifi_service_set_enabled(enable);
+        if (ret != ESP_OK) {
+            ESP_UTILS_LOGW("Set Wi-Fi enabled=%d failed: %s", enable, esp_err_to_name(ret));
+        }
+
+        if (enable && ret == ESP_OK) {
+            self->setUiState(UiState::Scanning);
+            self->requestScan();
+        } else {
+            self->setUiState(UiState::Off);
+            if (enable) {
+                self->showMessage("Wi-Fi unavailable", "Unable to turn on Wi-Fi.");
+            }
+        }
+    }
+
+    void WlanPage::refresh_event_cb(lv_event_t *e)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
+        if (self == nullptr || self->ui_state != UiState::Idle) {
+            return;
+        }
+        // The button is rebuilt by the scan state change; do not delete it inside its own event.
+        lv_async_call([](void *param) {
+            WlanPage *page = static_cast<WlanPage *>(param);
+            if (page->page_root == nullptr || page->ui_state != UiState::Idle) {
+                return;
+            }
+            page->setUiState(UiState::Scanning);
+            page->requestScan();
+        }, self);
+    }
+
+    void WlanPage::ap_btn_event_cb(lv_event_t *e)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
+        lv_obj_t *btn = static_cast<lv_obj_t *>(lv_event_get_current_target(e));
+        if (self == nullptr || btn == nullptr || self->ui_state != UiState::Idle) {
+            return;
+        }
+
+        const size_t index = reinterpret_cast<size_t>(lv_obj_get_user_data(btn));
+        if (index >= self->ap_list.size()) {
+            return;
+        }
+
+        self->selected_ap = self->ap_list[index];
+        ESP_UTILS_LOGI("Selected SSID: %s", self->selected_ap.ssid);
+        // Connecting rebuilds the list, which would delete this row inside its own event.
+        lv_async_call([](void *param) {
+            WlanPage *page = static_cast<WlanPage *>(param);
+            if (page->page_root == nullptr || page->ui_state != UiState::Idle) {
+                return;
+            }
+            if (page->selected_ap.authmode == WIFI_AUTH_OPEN) {
+                page->startConnect(page->selected_ap, "");
+            } else {
+                page->showPasswordInput(page->selected_ap);
+            }
+        }, self);
+    }
+
+    void WlanPage::conn_btn_event_cb(lv_event_t *e)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
+        if (self != nullptr && self->ui_state == UiState::Idle) {
+            self->showForgetConfirm();
+        }
+    }
+
+    // Keyboard READY submits the password, CANCEL returns to the network list.
     void WlanPage::kb_event_cb(lv_event_t *e)
     {
-        WlanPage *self = (WlanPage *)lv_event_get_user_data(e);
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
         lv_event_code_t code = lv_event_get_code(e);
+        if (self == nullptr || self->ui_state != UiState::Password) {
+            return;
+        }
 
         if (code == LV_EVENT_CANCEL) {
-            lv_obj_add_flag(self->kb, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(self->ta, LV_OBJ_FLAG_HIDDEN);
-            if (self->password_title) {
-                lv_obj_add_flag(self->password_title, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_obj_remove_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
-            lv_textarea_set_text(self->ta, "");
+            self->setUiState(UiState::Idle);
             return;
         }
 
         if (code == LV_EVENT_READY) {
-
-            strlcpy(self->wifi_pwd, lv_textarea_get_text(ta), sizeof(self->wifi_pwd));
-            ESP_UTILS_LOGI("Wi-Fi password length: %u", static_cast<unsigned>(strlen(self->wifi_pwd)));
-            if (strlen(self->wifi_pwd) >= 8)
-            {
-                self->Wifi_state = CONNECTING;
-            }
-            else
-            {
-                self->Wifi_state = DISCONNECT;
-                lv_async_call(wifi_state_cb, self);
-            }
-            lv_obj_add_flag(self->kb, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(self->ta, LV_OBJ_FLAG_HIDDEN);
-            if (self->password_title) {
-                lv_obj_add_flag(self->password_title, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_obj_remove_flag(self->spinner, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_state(self->wlan_switch, LV_STATE_DISABLED);
-            lv_obj_add_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
-
-        }
-    }
-
-    // Textarea focus controls keyboard visibility.
-    void WlanPage::ta_event_cb(lv_event_t * e)
-    {
-        WlanPage *self = (WlanPage *)lv_event_get_user_data(e);
-        lv_obj_t * ta = (lv_obj_t*)lv_event_get_target(e);
-
-        if (lv_event_get_code(e) == LV_EVENT_FOCUSED) {
-            lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
-            lv_keyboard_set_textarea(kb, ta);
-        }
-        else if (lv_event_get_code(e) == LV_EVENT_DEFOCUSED) {
-            lv_obj_remove_flag(self->list1, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(ta, LV_OBJ_FLAG_HIDDEN);
-            if (self->password_title) {
-                lv_obj_add_flag(self->password_title, LV_OBJ_FLAG_HIDDEN);
-            }
-            lv_keyboard_set_textarea(kb, NULL);
-        }
-    }
-
-    // ESP event loop callback. UI work is deferred with lv_async_call because the
-    // event loop does not run on the LVGL task.
-    void WlanPage::wifi_event_handler(void *arg, esp_event_base_t event_base,\
-                                int32_t event_id, void *event_data)
-    {
-        WlanPage *self = static_cast<WlanPage *>(arg);
-        if (!self) {
-            return;
-        }
-        if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-            // esp_wifi_connect();
-            ESP_UTILS_LOGI("WIFI_EVENT_STA_START");
-        } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-            if (self->Wifi_state == WIFICLOSE || !self->_nvs_param_map[NVS_KEY_WIFI_ENABLE]) {
-                self->connection_num = 0;
+            const char *password = lv_textarea_get_text(self->ta);
+            const size_t password_len = strlen(password);
+            ESP_UTILS_LOGI("Wi-Fi password length: %u", static_cast<unsigned>(password_len));
+            if (password_len < 8) {
+                lv_label_set_text(self->password_title, "Password must be at least 8 characters");
                 return;
             }
-            if (self->connection_num < 3)
-            {
-                esp_wifi_connect();
-                ESP_UTILS_LOGI("esp_wifi_connect");
-            }
-            else
-            {
-                self->connection_num = 0;
-                ESP_UTILS_LOGI("connection_fail");
-                self->Wifi_state = DISCONNECT;
-                lv_async_call(wifi_state_cb, self);
-            }
-            self->connection_num++;
-
-
-        } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-            // ESP_UTILS_LOGI("IP_EVENT_STA_GOT_IP");
-            ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-            ESP_UTILS_LOGI("got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-            self->Wifi_state = CONNECTED;
-            self->connection_num = 0;
-
-            lv_async_call(wifi_state_cb, self);
+            self->startConnect(self->selected_ap, password);
         }
-
     }
 
-    void WlanPage::start_wifi_events() {
-        if (wifi_events_registered) {
-            return;
-        }
-        // Register the Wi-Fi event handler
-        esp_err_t ret = esp_event_handler_register(WIFI_EVENT,
-                                                   ESP_EVENT_ANY_ID,
-                                                   &wifi_event_handler,
-                                                   this);
-        if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("Register Wi-Fi event handler failed: %s", esp_err_to_name(ret));
+    void WlanPage::dialog_btn_event_cb(lv_event_t *e)
+    {
+        WlanPage *self = static_cast<WlanPage *>(lv_event_get_user_data(e));
+        lv_obj_t *btn = static_cast<lv_obj_t *>(lv_event_get_current_target(e));
+        if (self == nullptr || btn == nullptr || self->dialog == nullptr) {
             return;
         }
 
-        ret = esp_event_handler_register(IP_EVENT,
-                                         IP_EVENT_STA_GOT_IP,
-                                         &wifi_event_handler,
-                                         this);
-        if (ret != ESP_OK) {
-            ESP_UTILS_LOGW("Register IP event handler failed: %s", esp_err_to_name(ret));
-            esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
-            return;
+        const intptr_t action = reinterpret_cast<intptr_t>(lv_obj_get_user_data(btn));
+        self->closeDialog(true);
+
+        if (action == DIALOG_ACTION_FORGET) {
+            self->forgetConnectedNetwork();
         }
-
-        wifi_events_registered = true;
-        ESP_UTILS_LOGI("Wi-Fi event handler registered.\n");
-    }
-
-    void WlanPage::stop_wifi_events() {
-        esp_err_t ret = esp_event_handler_unregister(WIFI_EVENT,
-                                                    ESP_EVENT_ANY_ID,
-                                                    &wifi_event_handler);
-        if (ret != ESP_OK)
-            ESP_UTILS_LOGI("Wi-Fi event handler unregistered Faile.\n");
-
-
-        ret = esp_event_handler_unregister(IP_EVENT,
-                                                    IP_EVENT_STA_GOT_IP,
-                                                    &wifi_event_handler);
-        if (ret != ESP_OK)
-            ESP_UTILS_LOGI("IP event handler unregistered Faile.\n");
-
-        wifi_events_registered = false;
-        ESP_UTILS_LOGI("Wi-Fi event handler unregistered.\n");
-    }
-
-    // Background Wi-Fi worker. It serializes scan and connect operations so the UI
-    // thread is never blocked by esp_wifi_scan_start(..., true).
-    void WlanPage::wifi_task(void *arg)
-    {
-        WlanPage *self = static_cast<WlanPage*>(arg);
-        if (!self) return;
-
-        while (self->wifi_task_running)
-        {
-            // ESP_UTILS_LOGI("Failed to get STA list");
-            if (self->Wifi_state == WIFIOPEN)
-            {
-                self->Wifi_state = WIFISCAN;
-
-                uint16_t number = DEFAULT_SCAN_LIST_SIZE;  // Maximum number of APs to scan for
-                uint16_t ap_count = 0;  // Variable to hold the number of found APs
-
-                // Start the Wi-Fi scan
-                esp_err_t ret = esp_wifi_scan_start(NULL, true);
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_scan_start failed: %s", esp_err_to_name(ret));
-                    self->Wifi_state = WIFICLOSE;
-                    lv_async_call(wifi_state_cb, self);
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    continue;
-                }
-
-                // Clear the ap_info array to hold fresh scan results
-                memset(self->ap_info, 0, sizeof(self->ap_info));
-
-                ESP_UTILS_LOGI("Max AP number ap_info can hold = %u", number);
-                ret = esp_wifi_scan_get_ap_num(&ap_count);
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_scan_get_ap_num failed: %s", esp_err_to_name(ret));
-                    ap_count = 0;
-                }
-                ret = esp_wifi_scan_get_ap_records(&number, self->ap_info);
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("esp_wifi_scan_get_ap_records failed: %s", esp_err_to_name(ret));
-                    number = 0;
-                }
-                self->scanned_ap_count = number;
-                ESP_UTILS_LOGI("Total APs scanned = %u, actual AP number ap_info holds = %u", ap_count, number);
-
-                if (self->page_active) {
-                    lv_async_call([](void *param) {
-                        auto page = static_cast<WlanPage *>(param);
-                        if (!page || !page->page_active || !page->list1) {
-                            return;
-                        }
-                        lv_timer_t *t = lv_timer_create(page->wifi_scan_cb, 20, page);
-                        if (t) {
-                            lv_timer_set_repeat_count(t, 1);
-                        } else {
-                            ESP_UTILS_LOGW("Create Wi-Fi scan refresh timer failed");
-                        }
-                    }, self);
-                }
-            }
-
-            if (self->Wifi_state == CONNECTING)
-            {
-                ESP_UTILS_LOGI("ssid:%s", self->wifi_ssid);
-                ESP_UTILS_LOGI("password length:%u", static_cast<unsigned>(strlen(self->wifi_pwd)));
-
-                // ESP_UTILS_LOGI("authmode:%d", self->ap_info[self->wifi_index].authmode);
-                esp_wifi_disconnect();
-
-                wifi_config_t wifi_config = {};
-                strlcpy((char *)wifi_config.sta.ssid, (const char *)self->wifi_ssid, sizeof(wifi_config.sta.ssid));
-                strlcpy((char *)wifi_config.sta.password, self->wifi_pwd, sizeof(wifi_config.sta.password));
-                wifi_config.sta.threshold.authmode = self->ap_info[self->wifi_index].authmode;
-
-                // Set WiFi configuration
-                esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-                if (ret == ESP_OK) {
-                    ret = esp_wifi_connect();
-                }
-                if (ret != ESP_OK) {
-                    ESP_UTILS_LOGW("Connect WiFi failed: %s", esp_err_to_name(ret));
-                    self->Wifi_state = DISCONNECT;
-                    lv_async_call(wifi_state_cb, self);
-                }
-
-                self->Wifi_state = DISCONNECT;
-            }
-
-            // Delay for 10ms before the next loop iteration
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
-        self->wifi_TaskHandle = nullptr;
-        vTaskDelete(NULL);
-    }
-
-    // Load or create persisted page settings.
-    bool WlanPage::loadNvsParam(void)
-    {
-        nvs_handle_t nvs_handle;
-        esp_err_t err = nvs_open(NVS_STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE("NVS", "Error (%s) opening NVS handle!", esp_err_to_name(err));
-            return false;
-        }
-
-        for (auto& key_value : _nvs_param_map) {
-            int32_t val = key_value.second;
-            err = nvs_get_i32(nvs_handle, key_value.first.c_str(), &val);
-            if (err == ESP_OK) {
-                key_value.second = val;
-                ESP_LOGI("NVS", "Load %s: %ld", key_value.first.c_str(), key_value.second);
-            } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-                err = nvs_set_i32(nvs_handle, key_value.first.c_str(), val);
-                if (err != ESP_OK) {
-                    ESP_LOGE("NVS", "Error (%s) setting default for %s", esp_err_to_name(err), key_value.first.c_str());
-                    nvs_close(nvs_handle);
-                    return false;
-                }
-                ESP_LOGW("NVS", "Key %s not found, set default: %ld", key_value.first.c_str(), val);
-            } else {
-                ESP_LOGE("NVS", "Error (%s) reading key %s", esp_err_to_name(err), key_value.first.c_str());
-                nvs_close(nvs_handle);
-                return false;
-            }
-        }
-
-        err = nvs_commit(nvs_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE("NVS", "Error (%s) committing NVS changes", esp_err_to_name(err));
-            nvs_close(nvs_handle);
-            return false;
-        }
-
-        nvs_close(nvs_handle);
-        return true;
-    }
-
-    bool WlanPage::setNvsParam(std::string key, int value)
-    {
-        nvs_handle_t nvs_handle;
-        esp_err_t err = nvs_open(NVS_STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE("NVS", "Error (%s) opening NVS handle!", esp_err_to_name(err));
-            return false;
-        }
-
-        int32_t v = value;
-        err = nvs_set_i32(nvs_handle, key.c_str(), v);
-        if (err != ESP_OK) {
-            ESP_LOGE("NVS", "Error (%s) setting %s", esp_err_to_name(err), key.c_str());
-            nvs_close(nvs_handle);
-            return false;
-        }
-
-        err = nvs_commit(nvs_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE("NVS", "Error (%s) committing NVS changes", esp_err_to_name(err));
-            nvs_close(nvs_handle);
-            return false;
-        }
-
-        ESP_LOGI("NVS", "Set %s = %d", key.c_str(), value);
-        nvs_close(nvs_handle);
-        return true;
     }
 } // namespace esp_brookesia::apps

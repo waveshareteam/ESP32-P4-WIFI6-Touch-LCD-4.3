@@ -5,6 +5,8 @@
 namespace esp_brookesia::apps::settings_ui {
 
 static constexpr lv_coord_t PAGE_HEADER_HEIGHT = 72;
+static constexpr lv_coord_t HEADER_BUTTON_SIZE = 48;
+static constexpr lv_coord_t HEADER_BUTTON_EDGE_MARGIN = 20;
 static constexpr lv_coord_t PAGE_HORIZONTAL_MARGIN = 32;
 static constexpr lv_coord_t CONTENT_TOP_GAP = 12;
 static constexpr lv_coord_t CONTENT_BOTTOM_MARGIN = 20;
@@ -19,10 +21,16 @@ static constexpr uint32_t COLOR_PRIMARY_TEXT = 0xFFFFFF;
 static constexpr uint32_t COLOR_SECONDARY_TEXT = 0xA7A7AD;
 static constexpr uint32_t COLOR_ACCENT = 0x00BFFF;
 
-inline lv_obj_t *create_page(lv_obj_t *screen)
+/*
+ * top_inset reserves space at the top of the screen, e.g. for a status bar
+ * that floats over the app. The page and everything sized in percent inside
+ * it then fit below that space.
+ */
+inline lv_obj_t *create_page(lv_obj_t *screen, lv_coord_t top_inset = 0)
 {
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BACKGROUND), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(screen, top_inset, LV_PART_MAIN);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *page = lv_obj_create(screen);
@@ -52,8 +60,8 @@ inline lv_obj_t *create_header(
     lv_obj_t *back_button = nullptr;
     if (back_cb != nullptr) {
         back_button = lv_button_create(header);
-        lv_obj_set_size(back_button, 48, 48);
-        lv_obj_align(back_button, LV_ALIGN_LEFT_MID, 20, 0);
+        lv_obj_set_size(back_button, HEADER_BUTTON_SIZE, HEADER_BUTTON_SIZE);
+        lv_obj_align(back_button, LV_ALIGN_LEFT_MID, HEADER_BUTTON_EDGE_MARGIN, 0);
         lv_obj_set_style_radius(back_button, 8, LV_PART_MAIN);
         lv_obj_set_style_border_width(back_button, 0, LV_PART_MAIN);
         lv_obj_set_style_shadow_width(back_button, 0, LV_PART_MAIN);
@@ -69,19 +77,17 @@ inline lv_obj_t *create_header(
         lv_obj_center(back_icon);
     }
 
-    lv_obj_update_layout(page);
-    const lv_coord_t title_x = (back_button != nullptr) ? 84 : PAGE_HORIZONTAL_MARGIN;
-    lv_coord_t title_width = lv_obj_get_width(page) - title_x - PAGE_HORIZONTAL_MARGIN;
-    if (title_width < 1) {
-        title_width = 1;
-    }
-
     lv_obj_t *title_label = lv_label_create(header);
     lv_label_set_text(title_label, title);
     lv_label_set_long_mode(title_label, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_width(title_label, title_width);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_30, LV_PART_MAIN);
     lv_obj_set_style_text_color(title_label, lv_color_hex(COLOR_PRIMARY_TEXT), LV_PART_MAIN);
+
+    lv_obj_update_layout(page);
+    const lv_coord_t title_x = (back_button != nullptr) ?
+                               (HEADER_BUTTON_EDGE_MARGIN + HEADER_BUTTON_SIZE + 16) : PAGE_HORIZONTAL_MARGIN;
+    const lv_coord_t title_width = lv_obj_get_width(page) - title_x - PAGE_HORIZONTAL_MARGIN;
+    lv_obj_set_width(title_label, LV_MAX(static_cast<lv_coord_t>(1), title_width));
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, title_x, 0);
 
     return back_button;
@@ -105,6 +111,7 @@ inline lv_obj_t *create_content_list(lv_obj_t *page)
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, PAGE_HEADER_HEIGHT + CONTENT_TOP_GAP);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+
     return list;
 }
 

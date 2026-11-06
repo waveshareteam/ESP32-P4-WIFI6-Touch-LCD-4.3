@@ -2,6 +2,7 @@
 #include "SettingsUI.hpp"
 #include "esp_log.h"
 #include "../Settings.hpp"
+#include "../SettingsStorage.hpp"
 
 #define ESP_UTILS_LOG_TAG "BS:SoundPage"
 #include "esp_lib_utils.h"
@@ -34,7 +35,7 @@ namespace esp_brookesia::apps
         ESP_UTILS_LOGD("SoundPage Run");
         lv_obj_clean(lv_scr_act());
 
-        page_root = settings_ui::create_page(lv_scr_act());
+        page_root = settings_ui::create_page(lv_scr_act(), Settings::requestInstance()->getContentTopInset());
         settings_ui::create_header(page_root, "Sound", [](lv_event_t *e) {
             (void)e;
             lv_async_call([](void *param) {
@@ -62,9 +63,9 @@ namespace esp_brookesia::apps
         lv_obj_set_style_text_color(title, lv_color_hex(settings_ui::COLOR_PRIMARY_TEXT), LV_PART_MAIN);
         lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
-        uint32_t value = bsp_extra_codec_volume_get();
-        if (value > 95) {
-            value = 95;
+        uint32_t value = board_codec_volume_get();
+        if (value > static_cast<uint32_t>(settings_storage::VOLUME_MAX)) {
+            value = static_cast<uint32_t>(settings_storage::VOLUME_MAX);
         }
 
         label = lv_label_create(slider_container);
@@ -77,7 +78,7 @@ namespace esp_brookesia::apps
         lv_obj_set_width(volume_slider, lv_pct(100));
         lv_obj_set_height(volume_slider, 14);
         lv_obj_align(volume_slider, LV_ALIGN_BOTTOM_MID, 0, -5);
-        lv_slider_set_range(volume_slider, 0, 95);
+        lv_slider_set_range(volume_slider, settings_storage::VOLUME_MIN, settings_storage::VOLUME_MAX);
         lv_slider_set_value(volume_slider, value, LV_ANIM_OFF);
 
         lv_obj_set_style_bg_color(volume_slider, lv_color_hex(0x505050), LV_PART_MAIN);
@@ -86,6 +87,8 @@ namespace esp_brookesia::apps
         lv_obj_set_style_pad_all(volume_slider, 7, LV_PART_KNOB);
         lv_obj_set_style_radius(volume_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_obj_add_event_cb(volume_slider, event_handler_cb, LV_EVENT_VALUE_CHANGED, this);
+        // Persist once the finger is lifted instead of on every drag step.
+        lv_obj_add_event_cb(volume_slider, event_handler_cb, LV_EVENT_RELEASED, this);
         return true;
     }
 
@@ -98,10 +101,14 @@ namespace esp_brookesia::apps
         }
 
         const uint32_t value = lv_slider_get_value(slider);
+        if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+            settings_storage::saveVolume(static_cast<int>(value));
+            return;
+        }
         if (instance->label != nullptr) {
             lv_label_set_text_fmt(instance->label, "%lu%%", static_cast<unsigned long>(value));
         }
-        bsp_extra_codec_volume_set(value, nullptr);
+        board_codec_volume_set(value, nullptr);
     }
 
     bool SoundPage::back()

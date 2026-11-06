@@ -4,12 +4,16 @@
  * SPDX-License-Identifier: CC0-1.0
  */
 
+#include <algorithm>
 #include <atomic>
+#include <string>
+#include <iterator>
 #include <new>
+#include <vector>
+#include "esp_lv_adapter_display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "bsp/esp-bsp.h"
 #include "esp_brookesia.hpp"
 #include "boost/thread.hpp"
 #ifdef ESP_UTILS_LOG_TAG
@@ -18,397 +22,73 @@
 #define ESP_UTILS_LOG_TAG "Main"
 #include "esp_lib_utils.h"
 
-#include "esp_event.h"
-#include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
-#include "esp_wifi.h"
 
-#include "bsp_board_extra.h"
-
-#include "Drawpanel.hpp"
-#include "SpecAnalyzer.hpp"
-#include "MusicPlayer.hpp"
-#include "Settings.hpp"
-#include "Camera.hpp"
-#include "VideoPlayer.hpp"
-#include "esp_brookesia_app_calculator.hpp"
-#include "XiaozhiApp.hpp"
+#include "board.h"
+#include "board_wifi.h"
+#include "SettingsStorage.hpp"
+#include "BootLoading.hpp"
 
 using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
 using namespace esp_brookesia::systems::phone;
 
-constexpr bool EXAMPLE_SHOW_MEM_INFO = false;
+constexpr bool EXAMPLE_SHOW_MEM_INFO = true;
+constexpr bool EXAMPLE_SHOW_MEM_INFO_LOG = false;
 
-static volatile bool s_wifi_connected = false;
+/*
+ * Apps register themselves with ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR and
+ * are installed from the registry. This table only sets the home-screen order
+ * and the boot stage shown while each group installs; names are the app names.
+ * Registered apps that are not listed here are installed after the last group.
+ */
+struct BootAppGroup {
+    const char *status;
+    int progress;
+    std::vector<const char *> apps;
+};
 
-static void wifi_status_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+static const BootAppGroup BOOT_APP_GROUPS[] = {
+    {"Loading application registry...", 65, {"DrawPanel", "Squareline"}},
+    {"Loading tools...",                74, {"Calculator", "SpecAnalyzer"}},
+    {"Loading media...",                82, {"MusicPlayer", "Camera", "VideoPlayer"}},
+    {"Loading system applications...",  90, {"Settings", "AIChats"}},
+};
+
+static std::atomic<bool> s_wifi_connected{false};
+
+// Runs in the Wi-Fi service publisher task; only record the state for the status bar timer.
+static void wifi_service_status_handler(const adf_event_t *event, void *ctx)
 {
-    (void)arg;
-    (void)event_data;
+    (void)ctx;
 
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        s_wifi_connected = true;
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-        s_wifi_connected = false;
-    } else if (event_base == WIFI_EVENT &&
-               (event_id == WIFI_EVENT_STA_DISCONNECTED || event_id == WIFI_EVENT_STA_STOP)) {
-        s_wifi_connected = false;
+    switch (event->event_id) {
+    case BOARD_WIFI_EVENT_STA_GOT_IP:
+        s_wifi_connected.store(true, std::memory_order_relaxed);
+        break;
+    case BOARD_WIFI_EVENT_STA_LOST_IP:
+    case BOARD_WIFI_EVENT_DISCONNECTED:
+        s_wifi_connected.store(false, std::memory_order_relaxed);
+        break;
+    default:
+        break;
     }
 }
 
-static void register_wifi_status_events()
+static void subscribe_wifi_status_events()
 {
-    static bool registered = false;
-    if (registered) {
-        return;
-    }
-
-    esp_err_t ret = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_status_event_handler, nullptr);
+    esp_err_t ret = board_wifi_service_subscribe(BOARD_WIFI_EVENT_ANY, wifi_service_status_handler, nullptr);
     if (ret != ESP_OK) {
-        ESP_LOGW(ESP_UTILS_LOG_TAG, "Register Wi-Fi status handler failed: %s", esp_err_to_name(ret));
-        return;
+        ESP_LOGW(ESP_UTILS_LOG_TAG, "Subscribe Wi-Fi service events failed: %s", esp_err_to_name(ret));
     }
-
-    ret = esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_status_event_handler, nullptr);
-    if (ret != ESP_OK) {
-        ESP_LOGW(ESP_UTILS_LOG_TAG, "Register IP status handler failed: %s", esp_err_to_name(ret));
-        esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_status_event_handler);
-        return;
-    }
-
-    registered = true;
 }
 
 static bool is_wifi_connected()
 {
-    return s_wifi_connected;
+    return s_wifi_connected.load(std::memory_order_relaxed);
 }
-
-namespace {
-
-class BootLoadingUi {
-public:
-    static constexpr uint32_t STATUS_UPDATE_PERIOD_MS = 30;
-    static constexpr uint32_t READY_HOLD_MS = 300;
-    static constexpr uint32_t FADE_OUT_TIME_MS = 240;
-
-    bool create()
-    {
-        root_ = lv_obj_create(lv_layer_top());
-        if (root_ == nullptr) {
-            return false;
-        }
-
-        spinner_ = lv_spinner_create(root_);
-        title_ = lv_label_create(root_);
-        phase_ = lv_label_create(root_);
-        status_ = lv_label_create(root_);
-        progress_ = lv_bar_create(root_);
-        if (spinner_ == nullptr || title_ == nullptr || phase_ == nullptr ||
-                status_ == nullptr || progress_ == nullptr) {
-            destroy();
-            return false;
-        }
-
-        lv_obj_remove_style_all(root_);
-        lv_obj_set_size(root_, lv_pct(100), lv_pct(100));
-        lv_obj_align(root_, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_bg_color(root_, lv_color_hex(0x101417), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(root_, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_clear_flag(root_, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(root_, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_set_size(spinner_, 64, 64);
-        lv_obj_align(spinner_, LV_ALIGN_CENTER, 0, -110);
-        lv_obj_set_style_arc_width(spinner_, 5, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(spinner_, 5, LV_PART_INDICATOR);
-        lv_obj_set_style_arc_color(spinner_, lv_color_hex(0x313B42), LV_PART_MAIN);
-        lv_obj_set_style_arc_color(spinner_, lv_color_hex(0x27C1A8), LV_PART_INDICATOR);
-
-        lv_label_set_text(title_, "ESP32-P4");
-        lv_obj_set_style_text_font(title_, &lv_font_montserrat_32, LV_PART_MAIN);
-        lv_obj_set_style_text_color(title_, lv_color_hex(0xF7F9FA), LV_PART_MAIN);
-        lv_obj_align(title_, LV_ALIGN_CENTER, 0, -36);
-
-        lv_label_set_text(phase_, "LOADING");
-        lv_obj_set_style_text_font(phase_, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(phase_, lv_color_hex(0xF2B84B), LV_PART_MAIN);
-        lv_obj_align(phase_, LV_ALIGN_CENTER, 0, 4);
-
-        lv_obj_set_width(status_, lv_pct(84));
-        lv_label_set_long_mode(status_, LV_LABEL_LONG_MODE_DOTS);
-        lv_obj_set_style_text_align(status_, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_set_style_text_font(status_, &lv_font_montserrat_18, LV_PART_MAIN);
-        lv_obj_set_style_text_color(status_, lv_color_hex(0xA8B1B8), LV_PART_MAIN);
-        lv_obj_align(status_, LV_ALIGN_CENTER, 0, 44);
-
-        lv_obj_set_size(progress_, lv_pct(52), 7);
-        lv_obj_align(progress_, LV_ALIGN_CENTER, 0, 82);
-        lv_bar_set_range(progress_, 0, 100);
-        lv_obj_set_style_radius(progress_, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_radius(progress_, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_color(progress_, lv_color_hex(0x2A343B), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(progress_, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(progress_, lv_color_hex(0x27C1A8), LV_PART_INDICATOR);
-        lv_obj_set_style_bg_opa(progress_, LV_OPA_COVER, LV_PART_INDICATOR);
-
-        update_timer_ = lv_timer_create(onUpdateTimer, STATUS_UPDATE_PERIOD_MS, this);
-        if (update_timer_ == nullptr) {
-            destroy();
-            return false;
-        }
-
-        setStageNow("Preparing display...", 8);
-        return true;
-    }
-
-    void queueStage(const char *status, int progress)
-    {
-        if (status == nullptr) {
-            return;
-        }
-
-        if (progress < 0) {
-            progress = 0;
-        } else if (progress > 100) {
-            progress = 100;
-        }
-
-        pending_status_.store(status, std::memory_order_relaxed);
-        pending_progress_.store(progress, std::memory_order_relaxed);
-        pending_revision_.fetch_add(1, std::memory_order_release);
-    }
-
-    void showError(const char *status)
-    {
-        if (root_ == nullptr) {
-            return;
-        }
-
-        stopUpdateTimer();
-        lv_obj_add_flag(spinner_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(phase_, "STARTUP FAILED");
-        lv_obj_set_style_text_color(phase_, lv_color_hex(0xF06A6A), LV_PART_MAIN);
-        lv_obj_align(phase_, LV_ALIGN_CENTER, 0, 4);
-        lv_label_set_text(status_, status);
-        lv_obj_set_style_text_color(status_, lv_color_hex(0xF7F9FA), LV_PART_MAIN);
-        lv_bar_set_value(progress_, 100, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(progress_, lv_color_hex(0xF06A6A), LV_PART_INDICATOR);
-        lv_obj_move_foreground(root_);
-    }
-
-    void finish()
-    {
-        if (root_ == nullptr) {
-            return;
-        }
-
-        stopUpdateTimer();
-        setStageNow("Ready", 100);
-
-        lv_anim_t fade;
-        lv_anim_init(&fade);
-        lv_anim_set_var(&fade, root_);
-        lv_anim_set_values(&fade, LV_OPA_COVER, LV_OPA_TRANSP);
-        lv_anim_set_time(&fade, FADE_OUT_TIME_MS);
-        lv_anim_set_delay(&fade, READY_HOLD_MS);
-        lv_anim_set_exec_cb(&fade, [](void *object, int32_t opacity) {
-            lv_obj_set_style_opa(static_cast<lv_obj_t *>(object), opacity, LV_PART_MAIN);
-        });
-        lv_anim_set_completed_cb(&fade, lv_obj_delete_anim_completed_cb);
-        lv_anim_start(&fade);
-
-        // The animation owns root_ now and deletes it from the LVGL task.
-        clearObjectPointers();
-    }
-
-    void attachToTopLayer(lv_display_t *display)
-    {
-        attachToLayer(display != nullptr ? lv_display_get_layer_top(display) : nullptr);
-    }
-
-    void attachToSystemLayer(lv_display_t *display)
-    {
-        attachToLayer(display != nullptr ? lv_display_get_layer_sys(display) : nullptr);
-    }
-
-    void destroy()
-    {
-        stopUpdateTimer();
-        if (root_ != nullptr) {
-            lv_obj_delete(root_);
-        }
-        clearObjectPointers();
-    }
-
-private:
-    static void onUpdateTimer(lv_timer_t *timer)
-    {
-        auto *self = static_cast<BootLoadingUi *>(lv_timer_get_user_data(timer));
-        if (self != nullptr) {
-            self->applyPendingStage();
-        }
-    }
-
-    void applyPendingStage()
-    {
-        const uint32_t revision = pending_revision_.load(std::memory_order_acquire);
-        if (revision == applied_revision_) {
-            return;
-        }
-
-        const char *status = pending_status_.load(std::memory_order_relaxed);
-        const int progress = pending_progress_.load(std::memory_order_relaxed);
-        if (status != nullptr) {
-            setStageNow(status, progress);
-        }
-        applied_revision_ = revision;
-    }
-
-    void setStageNow(const char *status, int progress)
-    {
-        if (root_ == nullptr) {
-            return;
-        }
-
-        lv_label_set_text(status_, status);
-        lv_bar_set_value(progress_, progress, LV_ANIM_OFF);
-        lv_obj_move_foreground(root_);
-    }
-
-    void stopUpdateTimer()
-    {
-        if (update_timer_ != nullptr) {
-            lv_timer_delete(update_timer_);
-            update_timer_ = nullptr;
-        }
-    }
-
-    void clearObjectPointers()
-    {
-        root_ = nullptr;
-        spinner_ = nullptr;
-        title_ = nullptr;
-        phase_ = nullptr;
-        status_ = nullptr;
-        progress_ = nullptr;
-    }
-
-    void attachToLayer(lv_obj_t *parent)
-    {
-        if (root_ == nullptr || parent == nullptr) {
-            return;
-        }
-
-        if (lv_obj_get_parent(root_) != parent) {
-            lv_obj_set_parent(root_, parent);
-            lv_obj_set_size(root_, lv_pct(100), lv_pct(100));
-            lv_obj_align(root_, LV_ALIGN_CENTER, 0, 0);
-        }
-        lv_obj_move_foreground(root_);
-    }
-
-    lv_obj_t *root_ = nullptr;
-    lv_obj_t *spinner_ = nullptr;
-    lv_obj_t *title_ = nullptr;
-    lv_obj_t *phase_ = nullptr;
-    lv_obj_t *status_ = nullptr;
-    lv_obj_t *progress_ = nullptr;
-    lv_timer_t *update_timer_ = nullptr;
-    std::atomic<const char *> pending_status_{nullptr};
-    std::atomic<int> pending_progress_{0};
-    std::atomic<uint32_t> pending_revision_{0};
-    uint32_t applied_revision_ = 0;
-};
-
-static void refresh_boot_loading(BootLoadingUi &loading, const char *status, int progress)
-{
-    ESP_LOGI(ESP_UTILS_LOG_TAG, "Startup stage begin: %s (%d%%)", status, progress);
-    loading.queueStage(status, progress);
-    ESP_LOGI(ESP_UTILS_LOG_TAG, "Startup stage queued: %s (%d%%)", status, progress);
-}
-
-class BootLoadingFailureGuard {
-public:
-    BootLoadingFailureGuard(BootLoadingUi &loading, lv_display_t *display)
-        : loading_(loading), display_(display)
-    {
-    }
-
-    ~BootLoadingFailureGuard()
-    {
-        if (!armed_) {
-            return;
-        }
-
-        LvLockGuard gui_guard;
-        loading_.attachToSystemLayer(display_);
-        loading_.showError("Unable to finish startup. Please restart the device.");
-    }
-
-    void dismiss()
-    {
-        armed_ = false;
-    }
-
-private:
-    BootLoadingUi &loading_;
-    lv_display_t *display_;
-    bool armed_ = true;
-};
-
-class PhoneStartupOwner {
-public:
-    PhoneStartupOwner(Phone *phone, BootLoadingUi &loading, lv_display_t *display)
-        : phone_(phone), loading_(loading), display_(display)
-    {
-    }
-
-    ~PhoneStartupOwner()
-    {
-        reset();
-    }
-
-    PhoneStartupOwner(const PhoneStartupOwner &) = delete;
-    PhoneStartupOwner &operator=(const PhoneStartupOwner &) = delete;
-
-    Phone *get() const
-    {
-        return phone_;
-    }
-
-    Phone *release()
-    {
-        Phone *phone = phone_;
-        phone_ = nullptr;
-        return phone;
-    }
-
-private:
-    void reset()
-    {
-        if (phone_ == nullptr) {
-            return;
-        }
-
-        if (!bsp_extra_display_lock(-1)) {
-            ESP_LOGE(ESP_UTILS_LOG_TAG, "Lock display while cleaning up phone failed");
-            return;
-        }
-        loading_.attachToTopLayer(display_);
-        delete phone_;
-        phone_ = nullptr;
-        bsp_extra_display_unlock();
-    }
-
-    Phone *phone_;
-    BootLoadingUi &loading_;
-    lv_display_t *display_;
-};
-
-} // namespace
 
 extern "C" void app_main(void)
 {
@@ -417,54 +97,33 @@ extern "C" void app_main(void)
     ESP_UTILS_LOGI("Reset reason: %d", static_cast<int>(esp_reset_reason()));
     ESP_UTILS_LOGI("Display ESP-Brookesia phone demo");
 
-    bsp_display_cfg_t cfg = {
-        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
-        .rotation = ESP_LV_ADAPTER_ROTATE_0,
-        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
-        .touch_flags = {
-            .swap_xy = 0,
-            .mirror_x = 0,
-            .mirror_y = 0}};
-
-    // Keep LVGL on core 1 with a larger PSRAM-backed stack; high-resolution UI and
-    // app switching can otherwise starve the GUI task or overflow the default stack.
-    cfg.lv_adapter_cfg.task_stack_size = 16 * 1024;
-    cfg.lv_adapter_cfg.task_priority = 10;
-    cfg.lv_adapter_cfg.task_core_id = 1;
-    cfg.lv_adapter_cfg.stack_in_psram = true;
-
-    /* Configure display */
-    lv_display_t *disp = bsp_display_start_with_config(&cfg);
+    lv_display_t *disp = board_display_start();
     ESP_UTILS_CHECK_NULL_EXIT(disp, "Start display failed");
-    bsp_display_backlight_off();
+    board_display_backlight_off();
 
     /* Configure GUI lock */
     LvLock::registerCallbacks([](int timeout_ms) {
-        bool locked = bsp_extra_display_lock(timeout_ms);
+        bool locked = board_display_lock(timeout_ms);
         ESP_UTILS_CHECK_FALSE_RETURN(locked, false, "Lock failed (timeout_ms: %d)", timeout_ms);
 
         return true;
     }, []() {
-        bsp_extra_display_unlock();
+        board_display_unlock();
         return true;
     });
 
     BootLoadingUi boot_loading;
-    ESP_LOGI(ESP_UTILS_LOG_TAG, "Startup stage begin: Preparing display... (8%%)");
-    {
-        LvLockGuard gui_guard;
+    ESP_LOGI(ESP_UTILS_LOG_TAG, "Startup stage: Preparing display... (8%%)");
+    // The backlight stays off until the saved brightness has been loaded below.
+    apply_and_wait_for_frame(disp, [&]() {
         if (!boot_loading.create()) {
             ESP_LOGE(ESP_UTILS_LOG_TAG, "Create boot loading UI failed");
         }
-    }
-    ESP_LOGI(ESP_UTILS_LOG_TAG, "Startup stage ready: Preparing display... (8%%)");
-    // Let the LVGL worker render the first frame before enabling the backlight.
-    vTaskDelay(pdMS_TO_TICKS(50));
-    bsp_display_backlight_on();
+    }, BOOT_FIRST_FRAME_WAIT_MS);
 
     BootLoadingFailureGuard boot_failure_guard(boot_loading, disp);
 
-    refresh_boot_loading(boot_loading, "Initializing settings...", 16);
+    refresh_boot_loading(boot_loading, disp, "Initializing settings...", 16);
     ESP_LOGI(ESP_UTILS_LOG_TAG, "NVS initialization begin");
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -482,46 +141,58 @@ extern "C" void app_main(void)
     }
     ESP_LOGI(ESP_UTILS_LOG_TAG, "NVS initialization complete");
 
-    refresh_boot_loading(boot_loading, "Mounting storage...", 20);
-    err = bsp_spiffs_mount();
+    // Load the persisted parameters before any app reads them. Apps can still
+    // run without the service, so a failure only disables persistence.
+    if (!services::StorageNVS::requestInstance().begin()) {
+        ESP_LOGW(ESP_UTILS_LOG_TAG, "StorageNVS service failed to start; settings will not persist");
+    }
+
+    // The "Initializing settings..." frame was rendered above; let the panel
+    // scan it out, then light the backlight at the user's saved brightness.
+    vTaskDelay(pdMS_TO_TICKS(BOOT_SCANOUT_WAIT_MS));
+    fade_in_backlight(apps::settings_storage::loadBrightness());
+
+    refresh_boot_loading(boot_loading, disp, "Mounting storage...", 20);
+    err = board_spiffs_mount();
     if (err != ESP_OK) {
         ESP_LOGE(ESP_UTILS_LOG_TAG, "SPIFFS mount failed: %s", esp_err_to_name(err));
         return;
     }
     ESP_LOGI(ESP_UTILS_LOG_TAG, "SPIFFS mount successfully");
 
-    refresh_boot_loading(boot_loading, "Starting audio...", 35);
-    err = bsp_extra_codec_init();
+    refresh_boot_loading(boot_loading, disp, "Starting audio...", 28);
+    err = board_codec_init();
     if (err != ESP_OK) {
         ESP_LOGE(ESP_UTILS_LOG_TAG, "Codec initialization failed: %s", esp_err_to_name(err));
         return;
     }
 
-    refresh_boot_loading(boot_loading, "Configuring audio...", 45);
-    err = bsp_extra_codec_volume_set(CODEC_DEFAULT_VOLUME, NULL);
+    refresh_boot_loading(boot_loading, disp, "Configuring audio...", 45);
+    err = board_codec_volume_set(apps::settings_storage::loadVolume(), NULL);
     if (err != ESP_OK) {
         ESP_LOGE(ESP_UTILS_LOG_TAG, "Codec volume setup failed: %s", esp_err_to_name(err));
         return;
     }
 
     /* Create a phone object */
-    refresh_boot_loading(boot_loading, "Building home screen...", 55);
+    refresh_boot_loading(boot_loading, disp, "Building home screen...", 55);
     PhoneStartupOwner phone_owner(new (std::nothrow) Phone(disp), boot_loading, disp);
     Phone *phone = phone_owner.get();
     ESP_UTILS_CHECK_NULL_EXIT(phone, "Create phone failed");
-
     {
         // When operating on non-GUI tasks, should acquire a lock before operating on LVGL
         LvLockGuard gui_guard;
 
-        if (BSP_LCD_H_RES == 480 && BSP_LCD_V_RES == 800) {
-            const auto &target_stylesheet = ESP_BROOKESIA_PHONE_480_800_DARK_STYLESHEET();
-            ESP_UTILS_CHECK_FALSE_EXIT(phone->addStylesheet(target_stylesheet), "Add display stylesheet failed");
-            ESP_UTILS_CHECK_FALSE_EXIT(phone->activateStylesheet(target_stylesheet), "Activate display stylesheet failed");
-        } else {
-            ESP_UTILS_LOGE(ESP_UTILS_LOG_TAG, "No compatible display stylesheet");
-            return;
+        // Select the layout from LVGL's logical resolution; other displays use the default layout.
+        const int width = lv_disp_get_hor_res(disp);
+        const int height = lv_disp_get_ver_res(disp);
+        const auto *target_stylesheet = &ESP_BROOKESIA_PHONE_DEFAULT_DARK_STYLESHEET();
+        if (width == 480 && height == 800) {
+            target_stylesheet = &ESP_BROOKESIA_PHONE_480_800_DARK_STYLESHEET();
         }
+        ESP_LOGI(ESP_UTILS_LOG_TAG, "Display resolution: %dx%d; stylesheet: %s", width, height, target_stylesheet->core.name);
+        ESP_UTILS_CHECK_FALSE_EXIT(phone->addStylesheet(*target_stylesheet), "Add display stylesheet failed");
+        ESP_UTILS_CHECK_FALSE_EXIT(phone->activateStylesheet(*target_stylesheet), "Activate display stylesheet failed");
 
         /* Begin the phone */
         ESP_UTILS_CHECK_FALSE_EXIT(phone->begin(), "Begin failed");
@@ -529,46 +200,58 @@ extern "C" void app_main(void)
         // assert(phone->getDisplay().showContainerBorder() && "Show container border failed");
     }
 
-    /* Init and install apps from registry */
-    refresh_boot_loading(boot_loading, "Loading application registry...", 65);
-    {
-        std::vector<systems::base::Manager::RegistryAppInfo> inited_apps;
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->initAppFromRegistry(inited_apps), "Init app registry failed");
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installAppFromRegistry(inited_apps), "Install app registry failed");
+    /* Install registered apps group by group, in BOOT_APP_GROUPS order. */
+    std::vector<systems::base::Manager::RegistryAppInfo> registry_apps;
+    auto &app_manager = phone->getManager();
+    const size_t group_count = std::size(BOOT_APP_GROUPS);
+    for (size_t group_index = 0; group_index < group_count; ++group_index) {
+        const BootAppGroup &group = BOOT_APP_GROUPS[group_index];
+        refresh_boot_loading(boot_loading, disp, group.status, group.progress);
+
+        // Creating and installing apps builds home-screen widgets; hold the LVGL lock.
+        LvLockGuard gui_guard;
+        if (group_index == 0) {
+            ESP_UTILS_CHECK_FALSE_EXIT(app_manager.initAppFromRegistry(registry_apps), "Init app registry failed");
+        }
+
+        auto install = [&](const std::string & name, systems::base::App * app) {
+            ESP_UTILS_LOGI("Install app: %s", name.c_str());
+            return app_manager.checkAppID_Valid(app_manager.installApp(app));
+        };
+        for (const char *app_name : group.apps) {
+            auto it = std::find_if(registry_apps.begin(), registry_apps.end(), [app_name](const auto & info) {
+                return std::get<0>(info) == app_name;
+            });
+            if (it == registry_apps.end()) {
+                ESP_UTILS_LOGW("App %s is not registered; skip it", app_name);
+                continue;
+            }
+            ESP_UTILS_CHECK_FALSE_EXIT(install(std::get<0>(*it), std::get<1>(*it).get()), "Install app %s failed", app_name);
+            registry_apps.erase(it);
+        }
+
+        if (group_index + 1 == group_count) {
+            for (const auto &[name, app] : registry_apps) {
+                ESP_UTILS_CHECK_FALSE_EXIT(install(name, app.get()), "Install app %s failed", name.c_str());
+            }
+            registry_apps.clear();
+        }
     }
 
-    refresh_boot_loading(boot_loading, "Loading tools...", 74);
-    {
-        auto app2 = esp_brookesia::apps::Calculator::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(app2), "Start Calculator failed");
-        auto app = esp_brookesia::apps::Drawpanel::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(app), "Start Drawpanel failed");
-
-        auto app1 = esp_brookesia::apps::SpecAnalyzer::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(app1), "Start SpecAnalyzer failed");
+    // Apps subscribed to Wi-Fi service events during install; start Wi-Fi last so it does not delay the UI.
+    refresh_boot_loading(boot_loading, disp, "Starting Wi-Fi...", 93);
+    subscribe_wifi_status_events();
+    err = board_wifi_service_init();
+    if (err != ESP_OK) {
+        // Keep booting without networking.
+        ESP_LOGE(ESP_UTILS_LOG_TAG, "Wi-Fi service initialization failed: %s", esp_err_to_name(err));
+    }
+    // The service may already have an address (e.g. the init call was a no-op).
+    if (board_wifi_service_is_connected()) {
+        s_wifi_connected.store(true, std::memory_order_relaxed);
     }
 
-    refresh_boot_loading(boot_loading, "Loading media...", 82);
-    {
-        auto app5 = esp_brookesia::apps::MusicPlayer::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(app5), "Start MusicPlayer failed");
-        auto camera_app = esp_brookesia::apps::Camera::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(camera_app), "Start Camera failed");
-        auto video_player_app = esp_brookesia::apps::VideoPlayer::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(video_player_app), "Start VideoPlayer failed");
-    }
-
-    refresh_boot_loading(boot_loading, "Loading system applications...", 90);
-    {
-        auto settings_app = esp_brookesia::apps::Settings::requestInstance(false, false);
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(settings_app), "Start Settings failed");
-        auto xiaozhi_app = esp_brookesia::apps::XiaozhiApp::requestInstance();
-        ESP_UTILS_CHECK_FALSE_EXIT(phone->installApp(xiaozhi_app), "Start Xiaozhi failed");
-    }
-
-    refresh_boot_loading(boot_loading, "Finishing setup...", 96);
-
-    register_wifi_status_events();
+    refresh_boot_loading(boot_loading, disp, "Finishing setup...", 96);
 
     {
         LvLockGuard gui_guard;
@@ -590,9 +273,7 @@ extern "C" void app_main(void)
             );
 
             bool connected = is_wifi_connected();
-            StatusBar::WifiState wifi_state = connected ?
-                StatusBar::WifiState::SIGNAL_3 :
-                StatusBar::WifiState::DISCONNECTED;
+            StatusBar::WifiState wifi_state = connected ? StatusBar::WifiState::SIGNAL_3 : StatusBar::WifiState::DISCONNECTED;
 
             ESP_UTILS_CHECK_FALSE_EXIT(
                 phone->getDisplay().getStatusBar()->setWifiIconState(wifi_state),
@@ -607,7 +288,7 @@ extern "C" void app_main(void)
         boot_loading.finish();
     }
 
-    if constexpr (EXAMPLE_SHOW_MEM_INFO) {
+    if constexpr(EXAMPLE_SHOW_MEM_INFO) {
         esp_utils::thread_config_guard thread_config({
             .name = "mem_info",
             .stack_size = 4096,
@@ -624,17 +305,18 @@ extern "C" void app_main(void)
                 internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
                 external_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
                 external_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-                snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "\t           Biggest /     Free /    Total\n"
-                    "\t  SRAM : [%8zu / %8zu / %8zu]\n"
-                    "\t PSRAM : [%8zu / %8zu / %8zu]",
-                    heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), internal_free, internal_total,
-                    heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), external_free, external_total
-                );
-                ESP_UTILS_LOGI("\n%s", buffer);
-
+                if (EXAMPLE_SHOW_MEM_INFO_LOG) {
+                    snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "\t           Biggest /     Free /    Total\n"
+                        "\t  SRAM : [%8zu / %8zu / %8zu]\n"
+                        "\t PSRAM : [%8zu / %8zu / %8zu]",
+                        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), internal_free, internal_total,
+                        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), external_free, external_total
+                    );
+                    ESP_UTILS_LOGI("\n%s", buffer);
+                }
                 {
                     LvLockGuard gui_guard;
                     ESP_UTILS_CHECK_FALSE_EXIT(
