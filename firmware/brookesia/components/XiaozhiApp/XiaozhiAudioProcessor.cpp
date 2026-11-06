@@ -10,6 +10,7 @@
 #include <cstring>
 #include <utility>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_vadn_models.h"
@@ -19,7 +20,15 @@ namespace esp_brookesia::apps {
 namespace {
 
 constexpr char TAG[] = "XiaozhiAudio";
+// Fixed gain on the AFE output (allowed range 0.1 to 10.0). At 30 dB PGA, speech
+// at a normal distance reaches only about -45 dBFS, too quiet for the server ASR;
+// 4.0 adds about 12 dB.
+constexpr float AFE_OUTPUT_LINEAR_GAIN = 4.0f;
 constexpr char AFE_INPUT_FORMAT[] = "MMR";
+static_assert(
+    sizeof(AFE_INPUT_FORMAT) - 1 == XiaozhiAudioProcessor::INPUT_CHANNELS,
+    "AFE input format must describe every fed channel"
+);
 
 class SemaphoreLock {
 public:
@@ -116,13 +125,15 @@ bool XiaozhiAudioProcessor::initialize()
             EVENT_TASK_EXITED
     );
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
         processingTaskEntry,
         "xiaozhi_afe",
         PROCESS_TASK_STACK_SIZE,
         this,
         PROCESS_TASK_PRIORITY,
-        &processing_task_
+        &processing_task_,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
     );
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create AFE processing task");
@@ -279,6 +290,30 @@ bool XiaozhiAudioProcessor::enableWakeWord(bool enable)
     if (!enable) {
         resetIfInactive();
     }
+    return true;
+}
+
+bool XiaozhiAudioProcessor::setWakeWordStrict(bool strict)
+{
+    SemaphoreLock afe_lock(afe_mutex_);
+    if (!afe_lock || !ready_.load() || shutting_down_.load() ||
+            !afe_iface_ || !afe_data_) {
+        return false;
+    }
+    if (strict_wake_word_ == strict) {
+        return true;
+    }
+    const int ret = strict ?
+                    (afe_iface_->set_wakenet_threshold ?
+                     afe_iface_->set_wakenet_threshold(afe_data_, 1, STRICT_WAKE_WORD_THRESHOLD) : -1) :
+                    (afe_iface_->reset_wakenet_threshold ?
+                     afe_iface_->reset_wakenet_threshold(afe_data_, 1) : -1);
+    if (ret != 1) {
+        ESP_LOGW(TAG, "Failed to %s the wake word threshold", strict ? "raise" : "reset");
+        return false;
+    }
+    strict_wake_word_ = strict;
+    ESP_LOGI(TAG, "Wake word threshold %s", strict ? "raised for playback" : "restored");
     return true;
 }
 
@@ -451,7 +486,10 @@ bool XiaozhiAudioProcessor::createAfe()
         return false;
     }
 
+    // Full-duplex AEC uses the ES7210 MIC3 speaker loopback, then BSS merges
+    // the two front microphones into one output channel.
     config->aec_init = true;
+    config->se_init = true;
     config->ns_init = false;
     config->vad_init = true;
     config->vad_mode = VAD_MODE_0;
@@ -462,6 +500,7 @@ bool XiaozhiAudioProcessor::createAfe()
     config->wakenet_init = true;
     config->wakenet_model_name = wakenet_model;
     config->agc_init = false;
+    config->afe_linear_gain = AFE_OUTPUT_LINEAR_GAIN;
     config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     afe_iface_ = esp_afe_handle_from_config(config);
@@ -508,6 +547,8 @@ void XiaozhiAudioProcessor::releaseResources()
         }
         afe_data_ = nullptr;
         afe_iface_ = nullptr;
+        // A new AFE instance starts at the model's default threshold.
+        strict_wake_word_ = false;
     }
 
     if (models_) {
@@ -760,7 +801,7 @@ void XiaozhiAudioProcessor::processingTaskEntry(void *arg)
     if (processor->event_group_) {
         xEventGroupSetBits(processor->event_group_, EVENT_TASK_EXITED);
     }
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 } // namespace esp_brookesia::apps

@@ -8,12 +8,13 @@ creates packages only for its selected lanes. Every package comes from that
 lane's `flasher_args.json`; none replaces the immutable factory images under
 [`firmware/`](../firmware/). Artifacts expire after seven days.
 
-The repository audit locks both checked-in images:
+The repository audit locks the checked-in images:
 
 | Image | Size | SHA-256 |
 | --- | ---: | --- |
 | `ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin` | 33,488,896 bytes | `f87b4b16f49704dc8b05b44953a45c011ca9c244e05547e035b4bfa3db74e022` |
 | `ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin` | 16,777,216 bytes | `60f1ea3c77d75c95bd1de75b12642fe11c53873e0290a9b96bb6bb7a4c3aad78` |
+| `ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-261106.bin` | 16,777,216 bytes | `e8cdef6903dc944680fbb3cbdd2165815736be0b11a8129232c1b4e177afd45b` |
 
 Changing any path, size, or digest requires an explicit release review and a
 matching audit-policy update; example CI never regenerates these files.

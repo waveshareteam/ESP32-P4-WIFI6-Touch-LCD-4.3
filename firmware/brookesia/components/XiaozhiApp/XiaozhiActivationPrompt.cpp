@@ -11,8 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "bsp/esp-bsp.h"
-#include "bsp_board_extra.h"
+#include "board.h"
 #include "decoder/impl/esp_opus_dec.h"
 #include "third_party/xiaozhi_esp32/ogg_demuxer.h"
 
@@ -32,7 +31,7 @@ constexpr size_t PCM_MONO_BUFFER_SIZE =
     SAMPLE_RATE * FRAME_DURATION_MS / 1000 * sizeof(int16_t);
 constexpr size_t PCM_STEREO_BUFFER_SIZE = PCM_MONO_BUFFER_SIZE * 2;
 constexpr size_t MAX_OGG_FILE_SIZE = 64 * 1024;
-constexpr char PROMPT_DIRECTORY[] = BSP_SPIFFS_MOUNT_POINT "/xiaozhi";
+constexpr char PROMPT_DIRECTORY[] = BOARD_SPIFFS_MOUNT_POINT "/xiaozhi";
 
 } // namespace
 
@@ -207,11 +206,11 @@ void XiaozhiActivationPrompt::run()
     }
 
     codec_touched = true;
-    codec_result = bsp_extra_codec_set_fs(
+    codec_result = board_codec_set_fs(
                        SAMPLE_RATE, 16, I2S_SLOT_MODE_STEREO
                    );
     if (codec_result == ESP_OK && shouldContinue()) {
-        bsp_extra_codec_mute_set(false);
+        board_codec_mute_set(false);
     }
     if (!shouldContinue()) {
         goto cleanup;
@@ -296,7 +295,7 @@ void XiaozhiActivationPrompt::run()
 
                     size_t bytes_written = 0;
                     size_t stereo_size = sample_count * 2 * sizeof(int16_t);
-                    if (bsp_extra_i2s_write(
+                    if (board_i2s_write(
                             stereo_pcm,
                             stereo_size,
                             &bytes_written,
@@ -346,9 +345,9 @@ cleanup:
 
     if (codec_touched) {
         if (codec_result == ESP_OK) {
-            bsp_extra_codec_mute_set(true);
+            board_codec_mute_set(true);
         }
-        bsp_extra_codec_dev_stop();
+        board_codec_dev_stop();
     }
 
     bool playback_completed = completed && shouldContinue();

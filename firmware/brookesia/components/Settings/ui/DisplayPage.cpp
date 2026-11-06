@@ -2,6 +2,7 @@
 #include "SettingsUI.hpp"
 #include "esp_log.h"
 #include "../Settings.hpp"
+#include "../SettingsStorage.hpp"
 
 #define ESP_UTILS_LOG_TAG "BS:DisplayPage"
 #include "esp_lib_utils.h"
@@ -34,7 +35,7 @@ namespace esp_brookesia::apps
         ESP_UTILS_LOGD("DisplayPage Run");
         lv_obj_clean(lv_scr_act());
 
-        page_root = settings_ui::create_page(lv_scr_act());
+        page_root = settings_ui::create_page(lv_scr_act(), Settings::requestInstance()->getContentTopInset());
         settings_ui::create_header(page_root, "Display", [](lv_event_t *e) {
             (void)e;
             lv_async_call([](void *param) {
@@ -62,11 +63,11 @@ namespace esp_brookesia::apps
         lv_obj_set_style_text_color(title, lv_color_hex(settings_ui::COLOR_PRIMARY_TEXT), LV_PART_MAIN);
         lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
-        int32_t value = bsp_display_brightness_get();
-        if (value < 20) {
-            value = 20;
-        } else if (value > 100) {
-            value = 100;
+        int32_t value = board_display_brightness_get();
+        if (value < settings_storage::BRIGHTNESS_MIN) {
+            value = settings_storage::BRIGHTNESS_MIN;
+        } else if (value > settings_storage::BRIGHTNESS_MAX) {
+            value = settings_storage::BRIGHTNESS_MAX;
         }
 
         label = lv_label_create(slider_container);
@@ -79,7 +80,7 @@ namespace esp_brookesia::apps
         lv_obj_set_width(brightness_slider, lv_pct(100));
         lv_obj_set_height(brightness_slider, 14);
         lv_obj_align(brightness_slider, LV_ALIGN_BOTTOM_MID, 0, -5);
-        lv_slider_set_range(brightness_slider, 20, 100);
+        lv_slider_set_range(brightness_slider, settings_storage::BRIGHTNESS_MIN, settings_storage::BRIGHTNESS_MAX);
         lv_slider_set_value(brightness_slider, value, LV_ANIM_OFF);
 
         lv_obj_set_style_bg_color(brightness_slider, lv_color_hex(0x505050), LV_PART_MAIN);
@@ -88,6 +89,8 @@ namespace esp_brookesia::apps
         lv_obj_set_style_pad_all(brightness_slider, 7, LV_PART_KNOB);
         lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_obj_add_event_cb(brightness_slider, event_handler_cb, LV_EVENT_VALUE_CHANGED, this);
+        // Persist once the finger is lifted instead of on every drag step.
+        lv_obj_add_event_cb(brightness_slider, event_handler_cb, LV_EVENT_RELEASED, this);
         return true;
     }
 
@@ -100,10 +103,14 @@ namespace esp_brookesia::apps
         }
 
         const int32_t value = lv_slider_get_value(slider);
+        if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+            settings_storage::saveBrightness(value);
+            return;
+        }
         if (instance->label != nullptr) {
             lv_label_set_text_fmt(instance->label, "%ld%%", static_cast<long>(value));
         }
-        bsp_display_brightness_set(value);
+        board_display_brightness_set(value);
     }
 
     bool DisplayPage::back()

@@ -51,6 +51,7 @@ private:
     static MusicPlayer *_instance;
     file_iterator_instance_t *_file_iterator;
     bool _player_active = false;
+    bool _resume_playback = false;
     bool _ui_active = false;
 };
 

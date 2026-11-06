@@ -16,7 +16,7 @@
 
 #include "lv_demo_music.h"
 #include "esp_log.h"
-#include "bsp_board_extra.h"
+#include "board.h"
 #include "audio_player.h"
 
 /*********************
@@ -399,14 +399,14 @@ void lv_demo_music_resume(void)
     }
 
     esp_err_t ret;
-    if (!pause_exit && pause && bsp_extra_player_is_playing_by_index(file_iterator, track_id)) {
+    if (!pause_exit && pause && board_player_is_playing_by_index(file_iterator, track_id)) {
         LV_LOG_USER("Resume music");
         ret = audio_player_resume();
     }
     else {
         pause_exit = false;
         LV_LOG_USER("Music is not playing. Start playing.");
-        ret = bsp_extra_player_play_index(file_iterator, track_id);
+        ret = board_player_play_index(file_iterator, track_id);
     }
 
     if(ret != ESP_OK) {
@@ -895,6 +895,12 @@ static void spectrum_draw_event_cb(lv_event_t * e)
         lv_opa_t opa = lv_obj_get_style_opa_recursive(obj, LV_PART_MAIN);
         if(opa < LV_OPA_MIN) return;
 
+        /* `spectrum`/`spectrum_len` are only assigned by track_load(). A redraw
+         * that happens before a track is loaded must not read through the
+         * unset pointer: out-of-range amplitudes turn every bar into a huge
+         * triangle and flood the panel with BAR_COLOR2 (blue). */
+        if(spectrum == NULL || spectrum_len == 0 || spectrum_i >= spectrum_len) return;
+
         lv_point_t center;
         lv_area_t obj_coords;
         lv_obj_get_coords(obj, &obj_coords);
@@ -966,6 +972,11 @@ static void spectrum_draw_event_cb(lv_event_t * e)
             else draw_dsc.color = lv_color_mix(BAR_COLOR2, BAR_COLOR1,
                                                       ((v - BAR_COLOR1_STOP) * 255) / (BAR_COLOR2_STOP - BAR_COLOR1_STOP));
 
+            /* Bound the bar radius so a corrupt amplitude can never paint over
+             * the whole screen. Legitimate amplitudes stay well below this. */
+            const uint32_t v_limit = (uint32_t)LV_MAX(lv_obj_get_width(obj), lv_obj_get_height(obj));
+            if(v > v_limit) v = v_limit;
+
             uint32_t di = deg + deg_space;
 
             int32_t x1_out = get_cos(di, v);
@@ -1006,6 +1017,8 @@ static void spectrum_anim_cb(void * a, int32_t v)
 
     spectrum_i = v;
     lv_obj_invalidate(obj);
+
+    if(spectrum == NULL || spectrum_len == 0 || spectrum_i >= spectrum_len) return;
 
     static uint32_t bass_cnt = 0;
     static int32_t last_bass = -1000;
