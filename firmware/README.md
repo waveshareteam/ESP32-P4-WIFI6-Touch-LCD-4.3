@@ -4,13 +4,12 @@
 
 Factory firmware for the ESP32-P4-WIFI6-Touch-LCD-4.3. Each BIN is a merged image flashed at `0x0`; the date in its file name is its version. 
 
-Select the firmware for your **ESP32-P4 chip revision**, which is distinct from the PCB revision. The 20261106 firmware is for rev3.2; the 20260820 and 20260206 firmware images are for rev1.3.
+Select the firmware for your **ESP32-P4 chip revision**, which is distinct from the PCB revision. The 20261106 firmware is for rev3.2; the 20260206 firmware is for rev1.3.
 
 | File | Purpose |
 | --- | --- |
 | [ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20261106.bin](ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20261106.bin) | Factory demo for ESP32-P4 rev3.2 |
-| [ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260820.bin](ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260820.bin) | Latest factory demo for ESP32-P4 rev1.3 |
-| [ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin](ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin) | Earlier factory demo for ESP32-P4 rev1.3 |
+| [ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin](ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin) | Factory demo for ESP32-P4 rev1.3 |
 
 Run the following commands from this directory, replacing `PORT` with the serial port for your board. Erasing flash removes saved settings and user data.
 
@@ -30,7 +29,7 @@ python -m esptool --chip esp32p4 --port PORT write-flash 0x0 ESP32-P4-WIFI6-Touc
 ESP32-P4 rev1.3:
 
 ```bash
-python -m esptool --chip esp32p4 --port PORT write-flash 0x0 ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260820.bin
+python -m esptool --chip esp32p4 --port PORT write-flash 0x0 ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin
 ```
 
 Related firmware source is in [`brookesia/`](brookesia/).

@@ -131,15 +131,11 @@ BSP_MANIFESTS = (
     "examples/esp-idf/12_usb_extend_screen/components/bsp_extra/idf_component.yml",
 )
 FACTORY_FIRMWARE_IMAGES = {
-    "firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin": (
+    "firmware/ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20260206.bin": (
         33_488_896,
         "f87b4b16f49704dc8b05b44953a45c011ca9c244e05547e035b4bfa3db74e022",
     ),
-    "firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin": (
-        16_777_216,
-        "60f1ea3c77d75c95bd1de75b12642fe11c53873e0290a9b96bb6bb7a4c3aad78",
-    ),
-    "firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-261106.bin": (
+    "firmware/ESP32-P4-WIFI6-Touch-LCD-4.3_FactoryOnly_20261106.bin": (
         16_777_216,
         "e8cdef6903dc944680fbb3cbdd2165815736be0b11a8129232c1b4e177afd45b",
     ),

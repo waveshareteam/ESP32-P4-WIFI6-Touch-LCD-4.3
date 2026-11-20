@@ -81,12 +81,7 @@ GT911 configuration: polling after probing `0x5D` then `0x14`, with reset on
 GPIO23 and no interrupt input. The product examples instead use the newer
 Registry BSP, which drives neither GT911 INT nor RST.
 
-The matching 16 MiB combined image is
-[`ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin`](firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin),
-which is flashed at offset `0x0`. The earlier
-[`ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin`](firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin)
-remains available as an immutable recovery image. Neither image is generated
-by the example workflow or treated as an ESP-IDF example artifact.
+See the [firmware guide](firmware/README.md) to download and flash the combined image for your ESP32-P4 chip revision.
 
 Follow the official product documentation for the required flashing tool and
 recovery procedure. See the [default firmware build guide](firmware/brookesia/README.md)

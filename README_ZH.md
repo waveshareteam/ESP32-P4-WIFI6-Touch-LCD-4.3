@@ -72,12 +72,7 @@ lane 500 Mbps 的速率和 30 MHz DPI 时钟，并保留该镜像的 GT911 配�
 `0x5D`、`0x14` 后轮询，RST 使用 GPIO23，不使用 INT。产品示例使用更新的 Registry
 BSP，不驱动 GT911 的 INT 或 RST。
 
-对应的 16 MiB 合并镜像为
-[`ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin`](firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260820.bin)，
-从偏移 `0x0` 开始烧录。此前的
-[`ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin`](firmware/ESP32-P4-WIFI6-Touch-LCD-4.3-FactoryOnly-260206.bin)
-继续作为不可变恢复镜像保留。两份镜像都不是示例构建工作流生成的产物，也不作为
-ESP-IDF 示例固件处理。
+请参阅[出厂固件说明](firmware/README_ZH.md)，按 ESP32-P4 芯片版本下载并烧录对应的合并镜像。
 
 请按照官方产品文档使用正确的烧录工具和恢复流程。复现 Rev3.x 源码请参阅
 [默认固件构建说明](firmware/brookesia/README_ZH.md)。编译通过不能替代实际硬件验证。
